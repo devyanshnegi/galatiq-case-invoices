@@ -112,6 +112,15 @@ def policy_problems(settings) -> list[str]:
         problems.append(f"approval.approver_limits: unknown role '{role}' (known: {', '.join(ROLES)})")
     for role in sorted({*p.senior_roles, p.override_required_role} - set(ROLES)):
         problems.append(f"human_review: unknown role '{role}'")
+    for display, role in p.reviewers.values():
+        if role not in ROLES:
+            problems.append(f"human_review.reviewers: {display} has unknown role '{role}'")
+    if p.reviewers:
+        roster_roles = {role for _, role in p.reviewers.values()}
+        if not roster_roles & set(p.senior_roles):
+            problems.append("human_review.reviewers: nobody on the roster is senior - two-person approvals could never complete")
+        if p.override_required_role not in roster_roles:
+            problems.append(f"human_review.reviewers: nobody is {p.override_required_role} - reopened invoices could never be paid")
     if p.vp_review_threshold >= p.cfo_threshold:
         problems.append("approval: vp_review_threshold should be below cfo_threshold")
     if settings.bank_dual_approved_limit < settings.bank_single_payment_limit:

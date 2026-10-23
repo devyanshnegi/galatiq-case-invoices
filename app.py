@@ -28,14 +28,27 @@ env_settings = load_settings()
 with st.sidebar:
     st.markdown("### 🧾 Acme AP")
     st.markdown("**👤 Signed in as**")
-    st.session_state.setdefault("reviewer", "Dana Lee")
-    st.session_state.setdefault("role", "vp_finance")
-    reviewer = st.text_input("Your name", key="reviewer",
-                             help="Recorded on every approval. The two-person rule needs two different names.")
     limits = env_settings.policy.approver_limits
-    role = st.selectbox("Role", list(review.ROLES), key="role",
-                        format_func=lambda r: f"{review.ROLES[r]} · " + ("no limit" if limits.get(r) is None else f"up to ${limits[r]:,.0f}"))
-    st.caption("Switch name/role to act as a second approver. (A real deployment would use SSO.)")
+
+    def limit_text(r: str) -> str:
+        return "no limit" if limits.get(r) is None else f"up to ${limits[r]:,.0f}"
+
+    roster = env_settings.policy.reviewers
+    if roster:
+        # The role comes from the approver roster (config/ap_policy.yaml) - nobody picks their own authority.
+        people = {display: role for display, role in roster.values()}
+        reviewer = st.selectbox("Reviewer", list(people), key="reviewer",
+                                help="Recorded on every action. The two-person rule needs two different people.")
+        role = people[reviewer]
+        st.caption(f"{review.ROLES[role]} · {limit_text(role)}. Switch reviewer to act as a second approver. "
+                   "(The roster stands in for SSO in this prototype.)")
+    else:
+        st.session_state.setdefault("reviewer", "Dana Lee")
+        st.session_state.setdefault("role", "vp_finance")
+        reviewer = st.text_input("Your name", key="reviewer",
+                                 help="Recorded on every approval. The two-person rule needs two different names.")
+        role = st.selectbox("Role", list(review.ROLES), key="role", format_func=lambda r: f"{review.ROLES[r]} · {limit_text(r)}")
+        st.caption("No approver roster configured: anyone can claim any role. Add human_review.reviewers to the policy.")
 
     with st.expander("⚙️ Engine", expanded=False):
         providers = list(DEFAULT_MODELS)

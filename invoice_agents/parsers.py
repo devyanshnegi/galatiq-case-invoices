@@ -85,11 +85,14 @@ def _json_line(li: dict) -> LineItem:
 def _from_json(data: dict) -> Invoice:
     vendor = data.get("vendor")
     vendor_name, vendor_address = (vendor.get("name"), vendor.get("address")) if isinstance(vendor, dict) else (vendor, None)
+    remit = (vendor.get("remit_to") if isinstance(vendor, dict) else None) or data.get("remit_to")
+    remit_address = remit.get("address") if isinstance(remit, dict) else remit
     items = [_json_line(li) for li in data.get("line_items") or data.get("items") or []]
     return Invoice(
         invoice_number=data.get("invoice_number"),
         vendor=vendor_name or None,
         vendor_address=vendor_address,
+        remit_to_address=remit_address or None,
         invoice_date=parse_date(data.get("date") or data.get("invoice_date")),
         due_date=parse_date(data.get("due_date")),
         due_date_raw=None if data.get("due_date") is None else str(data.get("due_date")),
@@ -290,6 +293,7 @@ def heuristic_extract(text: str) -> Invoice:
     inv.shipping = money_after(r"shipping|freight")
     inv.total = money_after(r"(?<!sub)(?:grand\s+)?total(?:\s+amount)?|amt|amount\s+due")
     inv.payment_terms = _label(clean, r"(?:payment|pymnt)\s+terms|terms")
+    inv.remit_to_address = _label(clean, r"remit(?:\s+(?:payment|payments))?\s*to|pay\s+to")
     notes = re.search(r"(?is)\bnotes?\s*:\s*(.+?)(?:\n\s*\n|\n\s*terms\s*:|$)", clean)
     inv.notes = re.sub(r"\s+", " ", notes.group(1)).strip() if notes else None
     if re.search(r"€|\bEUR\b", clean):

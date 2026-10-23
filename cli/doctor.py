@@ -57,13 +57,15 @@ def check_policy(settings: Settings) -> list[Check]:
     from invoice_agents.policy import policy_problems
 
     p = settings.policy
+    roster = f"; {len(p.reviewers)} people on the approver roster" if p.reviewers else "; no approver roster (anyone can claim any role)"
     if not settings.policy_file:
         return [Check(WARN, "Policy", "no policy file found - using built-in defaults", "create config/ap_policy.yaml (see docs/AP_POLICY.md)")]
     problems = policy_problems(settings)
     detail = f"{p.policy_id} v{p.version} from {settings.policy_file.name}"
     if problems:
         return [Check(FAIL, "Policy", f"{detail}: {len(problems)} problem(s) - {problems[0]}", "python main.py policy  (lists them all)")]
-    return [Check(OK, "Policy", f"{detail}; {len(p.always_escalate)} always-escalate rules; consistent")]
+    return [Check(OK if p.reviewers else WARN, "Policy", f"{detail}; {len(p.always_escalate)} always-escalate rules{roster}",
+                  "" if p.reviewers else "add human_review.reviewers to config/ap_policy.yaml")]
 
 
 def check_database(settings: Settings) -> list[Check]:
@@ -83,8 +85,22 @@ def check_database(settings: Settings) -> list[Check]:
     except Exception as exc:
         return [Check(FAIL, "Database", f"{path}: {exc}", "python -m invoice_agents.db --reset")]
     status = OK if items and mode.lower() == "wal" else WARN
-    return [Check(status, "Database", f"{path.name}: {items} SKUs, {vendors} vendors, {invoices} invoices ({pending} awaiting review), {mode} mode",
-                  "" if status == OK else "python -m invoice_agents.db --reset")]
+    out = [Check(status, "Database", f"{path.name}: {items} SKUs, {vendors} vendors, {invoices} invoices ({pending} awaiting review), {mode} mode",
+                 "" if status == OK else "python -m invoice_agents.db --reset")]
+    try:
+        store = Store(path)
+        found = store.unsettled()
+        store.close()
+        stuck, unknown = len(found["approved_unpaid"]), len(found["unknown_payments"])
+        if stuck or unknown:
+            out.append(Check(FAIL if unknown else WARN, "Unsettled payments",
+                             f"{stuck} approved but unpaid after a crash, {unknown} with an unknown bank outcome",
+                             "python main.py reconcile"))
+        else:
+            out.append(Check(OK, "Unsettled payments", "none"))
+    except Exception as exc:
+        out.append(Check(WARN, "Unsettled payments", f"couldn't check: {exc}"))
+    return out
 
 
 def check_samples() -> list[Check]:

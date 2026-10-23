@@ -42,6 +42,8 @@ Values in [brackets] are template choices for Acme to confirm.
 
 **SoD rule:** no single person may create a vendor, approve that vendor's invoice, *and* release its payment. — *Manual*
 
+**Approver roster.** Only people listed in `human_review.reviewers` (config/ap_policy.yaml) may approve, reject, hold or reopen, and only in their listed role. Nobody can pick their own authority. — *Agents*. The prototype has no login: the roster stands in for SSO, so a person choosing someone else's name is not prevented. In production, identity must come from SSO.
+
 ## 3. What a valid invoice must contain
 
 An invoice is **rejected** (returned to the vendor) if any of these are missing or invalid. — *Agents*
@@ -50,7 +52,7 @@ An invoice is **rejected** (returned to the vendor) if any of these are missing 
 |---|---|
 | Vendor legal name | Must identify a payee |
 | Due date | Must be a real calendar date. "Immediately", "yesterday" or a blank are not dates. |
-| Line items | At least one, each with a positive quantity and a non-negative unit price |
+| Line items | At least one, each with a positive quantity and a price (unit price or line amount); a line with neither makes the total unverifiable |
 | Total | Present and positive. Credit notes are handled under §9.2. |
 
 These should be present; missing them weakens checks and may trigger a hold:
@@ -123,7 +125,8 @@ Each action is recorded with the reviewer's name, role, time and note. It is sho
 | Two-way match (invoice ↔ PO) for services | Yes, plus budget-owner confirmation of delivery | Manual |
 | Price tolerance vs PO/contract/catalog | [+10%]; below catalog is accepted | **Agents** (vs catalog) |
 | Quantity tolerance vs goods receipt | [0%]: bill only what was received | Manual |
-| Freight charge tolerance | [5% of goods value] or as contracted | Manual |
+| Freight charge tolerance | [5% of goods value] or as contracted; above it always goes to a human | **Agents** |
+| Tax ceiling | Tax (stated rate or implied by the amounts) above [15%] of goods always goes to a human, even when the totals add up | **Agents** |
 | Quantity billed vs stock on record | Must not exceed it (all lines for a SKU added together) | **Agents** |
 | Unknown items (not in the catalog) | Reject | **Agents** |
 | Zero-stock or discontinued items | Reject as suspicious | **Agents** |
@@ -135,8 +138,10 @@ Whatever the amount, these are **never** paid automatically. — *Agents*. The l
 | Situation | Why | Required action |
 |---|---|---|
 | **Bank-detail change** requested on an invoice or email | The most expensive AP fraud: payment redirection | Call the vendor on a number **already on file** (never one in the request); a second approver confirms (§4.3); vendor master team updates (§7) |
-| **Remit-to address differs** from the vendor master | Payment redirection | As above |
-| **Look-alike vendor name** (e.g. "QuickShip Distribut**e**rs") | Impersonation | Confirm it's the same legal entity (tax ID, registration) |
+| **Remit-to address differs** from the vendor master, or the invoice asks to pay an address other than the vendor's own | Payment redirection | As above |
+| **Look-alike vendor name** (e.g. "QuickShip Distribut**e**rs"), or the same name with a different legal form ("Widgets **LLC**" vs approved "Widgets **Inc.**") | Impersonation | Confirm it's the same legal entity (tax ID, registration) |
+| **No invoice number** | Duplicates can't be detected reliably | Confirm it isn't a copy of an invoice already paid |
+| **Tax above the ceiling** (§5) | Overcharging through the tax line | Check the rate against the ship-to jurisdiction |
 | **Unknown vendor** (not in the vendor master) | No KYC done | Onboard under §7 first |
 | **Foreign currency** | FX rate and bank-route risk | Treasury confirms the rate and route |
 | **Revision of an invoice already paid or pending** | Risk of paying twice | AP reconciles against the PO; pay **only the difference** |
@@ -155,7 +160,8 @@ Whatever the amount, these are **never** paid automatically. — *Agents*. The l
 ## 8. Duplicates and revisions
 
 - **Exact duplicate** (same vendor, invoice number and amount) of an invoice that is approved, paid or pending: **reject**. This includes the same invoice arriving in another format, such as a PDF and an email. — *Agents*
-- **Same file received twice**: ignored at intake. — *Agents*
+- **Same file received twice**: ignored at intake (queue and watch-folder modes; other modes catch it as a duplicate). — *Agents*
+- **Revisions pay only the difference.** When a revision of an already-paid invoice is approved, the bank is paid the new total minus what was already paid under that invoice number. If nothing more is due, nothing is paid. — *Agents*
 - **Revision** (same number, different content): **escalate** (§6). — *Agents*
 - **Resubmission** of a previously rejected invoice: processed normally, with the earlier rejection shown to the reviewer. — *Agents*
 - The duplicate protection must also hold when invoices are processed **in parallel**. — *Agents (write-time re-check plus database constraints)*
@@ -176,7 +182,7 @@ Whatever the amount, these are **never** paid automatically. — *Agents*. The l
 
 ## 10. Tax
 
-1. Tax must match the rate for the ship-to jurisdiction and reconcile with the subtotal. — *Agents (reconciliation)*
+1. Tax must match the rate for the ship-to jurisdiction and reconcile with the subtotal. — *Agents (reconciliation, plus the [15%] ceiling in §5)*
 2. Tax charged on tax-exempt purchases (exemption certificate on file) is disputed, not paid. — *Manual*
 3. Reverse-charge and withholding tax are applied per jurisdiction rules. — *Manual*
 4. Tax point / supply date determines the applicable rate when rates change. — *Manual*
@@ -192,7 +198,8 @@ Whatever the amount, these are **never** paid automatically. — *Agents*. The l
 
 | Rule | Value | Enforcement |
 |---|---|---|
-| **Single-payment limit** at the bank | [$50,000] for automated payments. [$250,000] when two people approved (§4.3). Larger amounts are declined and go back to human review. | **Agents (bank-side)** |
+| **Single-payment limit** at the bank | [$50,000] for automated payments. [$250,000] when two people approved (§4.3). **Limits are in USD**: foreign-currency payments are converted at the treasury rate first. Larger amounts are declined and go back to human review. | **Agents (bank-side)** |
+| **Unconfirmed payments** | If a payment's outcome is unknown (a crash, a timeout, an unclear bank answer), the slot stays locked. No retry can pay twice, and the invoice is marked for reconciliation (`python main.py reconcile`; `doctor` reports these). Invoices left "approved but unpaid" by a crash are finished by `reconcile`. | **Agents** |
 | **One payment per invoice** | Enforced at the bank boundary (idempotent) | **Agents** |
 | Payment timing | Pay on the due date, not on approval; take early-payment discounts when the annualised return beats Acme's cost of capital [8%] (e.g. 2/10 Net 30 ≈ 37% annualised) | Manual (planned) |
 | Payment runs | [Twice weekly]; emergency payments need CFO approval and a written reason | Manual |
@@ -228,6 +235,7 @@ Anyone who suspects fraud must **not contact the requester through the details i
 | **Degradation** | If the model is unavailable, deterministic rules take over and the trace records it | Agents |
 | **Model changes** | Changing the model or provider requires a re-run of the load test (100% decision accuracy, **0 wrongly paid**) before go-live | Manual |
 | **Human override** | Humans can approve or reject any escalated invoice; the override and their note are logged | Agents |
+| **AI clients over MCP** | The `acme-ap` MCP server acts as exactly one configured person (`AP_MCP_REVIEWER`). Its approval tools take no name, so an AI client can't approve twice under two identities. Without the setting, approvals over MCP are disabled. | Agents |
 | **Data residency** | Invoice data stays on Acme infrastructure when using the local model; a hosted model needs a DPA | Manual |
 
 ## 15. Exceptions, disputes and service levels

@@ -29,7 +29,7 @@ def run(pipeline, path):
 
 def approve(pipeline, state, note="ok"):
     with contextlib.redirect_stdout(io.StringIO()):
-        resolve_pending(pipeline.store, state["invoice_id"], approve=True, reviewer="Dana (VP)", note=note, backend=pipeline.backend)
+        resolve_pending(pipeline.store, state["invoice_id"], approve=True, reviewer="Dana Lee", note=note, backend=pipeline.backend)
 
 
 def test_repeated_human_approvals_become_precedent(settings, tmp_path):
@@ -48,7 +48,7 @@ def test_a_single_precedent_or_any_rejection_is_not_enough(settings, tmp_path):
         a, b = run(pipeline, overpriced(tmp_path, 1)), run(pipeline, overpriced(tmp_path, 2))
         approve(pipeline, a)
         with contextlib.redirect_stdout(io.StringIO()):
-            resolve_pending(pipeline.store, b["invoice_id"], approve=False, reviewer="Dana (VP)", note="price not agreed")
+            resolve_pending(pipeline.store, b["invoice_id"], approve=False, reviewer="Dana Lee", note="price not agreed")
         c = run(pipeline, overpriced(tmp_path, 3))
     assert c["status"] == "pending_review" and "Precedent" in c["decision"]["reasoning"]
 

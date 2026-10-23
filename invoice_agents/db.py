@@ -11,7 +11,7 @@ import re
 import sqlite3
 import threading
 from contextlib import contextmanager, suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Iterator
@@ -143,6 +143,13 @@ CREATE TABLE IF NOT EXISTS audit_log (
 """
 
 _SUFFIXES = re.compile(r"\b(inc|incorporated|co|corp|corporation|company|ltd|limited|llc|plc|group)\b\.?")
+_CANONICAL_SUFFIX = {"incorporated": "inc", "corporation": "corp", "company": "co", "limited": "ltd"}
+
+
+def legal_suffix(name: str | None) -> str | None:
+    """'Widgets Inc.' -> 'inc', 'Widgets Incorporated' -> 'inc', 'Widgets LLC' -> 'llc', 'Widgets' -> None."""
+    found = [m.group(1) for m in _SUFFIXES.finditer((name or "").lower()) if m.group(1) != "group"]
+    return _CANONICAL_SUFFIX.get(found[-1], found[-1]) if found else None
 
 
 class DuplicateRecord(Exception):
@@ -275,16 +282,19 @@ class Store:
         return None
 
     def find_vendor(self, name: str | None) -> tuple[dict[str, Any] | None, str]:
-        """Return (vendor_row, match_type) where match_type is exact | alias | fuzzy | none."""
+        """Return (vendor_row, match_type) where match_type is exact | alias | suffix | fuzzy | none."""
         key = normalize_name(name)
         if not key:
             return None, "none"
         with self.connect() as conn:
             rows = [dict(r) for r in conn.execute("SELECT * FROM vendors")]
+        suffix = legal_suffix(name)
         for row in rows:
             row["aliases"] = json.loads(row["aliases"])
             if normalize_name(row["name"]) == key:
-                return row, "exact"
+                theirs = legal_suffix(row["name"])
+                # 'Widgets LLC' is not 'Widgets Inc.': same base name, different legal entity.
+                return row, ("suffix" if suffix and theirs and suffix != theirs else "exact")
         for row in rows:
             if any(normalize_name(a) == key for a in row["aliases"]):
                 return row, "alias"
@@ -436,11 +446,35 @@ class Store:
             return False
 
     def finish_payment(self, reference: str, status: str) -> None:
+        """success: record it. A definite bank refusal: free the slot for a retry. Anything else (unknown
+        outcome): keep the slot locked so no retry can pay twice until someone reconciles it."""
+        from .bank import DEFINITE_FAILURES
+
         with self.connect() as conn:
             if status == "success":
                 conn.execute("UPDATE payments SET status = ?, paid_at = ? WHERE reference = ?", (status, now_iso(), reference))
-            else:  # free the slot so a later retry can pay
+            elif status in DEFINITE_FAILURES:
                 conn.execute("DELETE FROM payments WHERE reference = ?", (reference,))
+            else:
+                conn.execute("UPDATE payments SET status = 'unknown' WHERE reference = ?", (reference,))
+
+    def paid_against(self, invoice_number: str | None, vendor: str | None, exclude_invoice_id: int) -> float:
+        """Already paid under this invoice number to this vendor by *other* ledger rows (revisions)."""
+        if not invoice_number:
+            return 0.0
+        key = normalize_name(vendor)
+        with self.connect() as conn:
+            rows = conn.execute("SELECT vendor, amount, currency FROM payments WHERE invoice_number = ? AND status = 'success' "
+                                "AND invoice_id != ?", (invoice_number, exclude_invoice_id)).fetchall()
+        return round(sum(r["amount"] or 0 for r in rows if normalize_name(r["vendor"]) == key), 2)
+
+    def unsettled(self, older_than_s: float = 300) -> dict[str, list[dict[str, Any]]]:
+        """Ledger rows a crash or an unclear bank answer left behind (for reconcile / doctor)."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=older_than_s)).isoformat(timespec="seconds")
+        with self.connect() as conn:
+            approved = [dict(r) for r in conn.execute("SELECT * FROM invoices WHERE status = 'approved' AND updated_at <= ?", (cutoff,))]
+            unknown = [dict(r) for r in conn.execute("SELECT * FROM payments WHERE status IN ('unknown', 'processing') AND paid_at <= ?", (cutoff,))]
+        return {"approved_unpaid": approved, "unknown_payments": unknown}
 
     def payment_for_invoice(self, invoice_id: int) -> dict[str, Any] | None:
         with self.connect() as conn:

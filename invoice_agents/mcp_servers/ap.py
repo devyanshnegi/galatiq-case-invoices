@@ -34,8 +34,13 @@ def _brief(state: dict) -> dict:
     }
 
 
-def build_server(pipeline: InvoicePipeline, allowed_root: Path = PROJECT_ROOT) -> MCPServer:
+def build_server(pipeline: InvoicePipeline, allowed_root: Path = PROJECT_ROOT, reviewer: str | None = None) -> MCPServer:
+    """`reviewer` (or AP_MCP_REVIEWER) is the one person this server acts as. Approval tools take no name:
+    otherwise an AI client could approve twice under two names and defeat the two-person rule."""
+    import os
+
     store = pipeline.store
+    acting_as = reviewer if reviewer is not None else os.getenv("AP_MCP_REVIEWER", "")
     server = MCPServer("acme-ap", instructions=(
         "Acme Corp accounts payable. Process invoice files, review what needs a human, approve or reject "
         "escalated invoices, and report on the ledger. Approving pays the vendor - confirm with the user first."))
@@ -77,33 +82,44 @@ def build_server(pipeline: InvoicePipeline, allowed_root: Path = PROJECT_ROOT) -
         return json.dumps([{**case_json(c), "can_reopen": review.why_cannot_reopen(c, settings.policy) is None,
                             "cannot_reopen_because": review.why_cannot_reopen(c, settings.policy)} for c in cases], default=str)
 
-    @server.tool(description="Approve or reject an escalated invoice. role is one of ap_specialist, department_approver, "
-                             "vp_finance, cfo. Large or risky invoices need two different approvers before payment. "
-                             "Approving can move money: confirm with the user first.")
-    def resolve_invoice(invoice_id: int, approve: bool, reviewer: str, note: str = "", role: str = "vp_finance") -> str:
+    def identity() -> tuple[str, str]:
+        if not acting_as:
+            raise review.ReviewError("review actions over MCP are disabled: set AP_MCP_REVIEWER to the person this server acts for")
+        role = review.roster_role(settings.policy, acting_as) or os.getenv("AP_MCP_ROLE", "vp_finance")
+        return acting_as, role
+
+    def guarded(action) -> str:
         try:
-            if approve:
-                outcome = review.approve(store, invoice_id, reviewer=reviewer, role=role, note=note, backend=pipeline.backend, settings=settings)
-            else:
-                outcome = review.reject(store, invoice_id, reviewer=reviewer, role=role, note=note, settings=settings)
+            return json.dumps(action(), default=str)
         except review.ReviewError as exc:
             return json.dumps({"error": str(exc)})
-        return json.dumps({"invoice_id": invoice_id, **outcome}, default=str)
+
+    @server.tool(description="Approve or reject an escalated invoice, as the person this server is configured for "
+                             "(AP_MCP_REVIEWER). Large or risky invoices need a second, different person before payment. "
+                             "Approving can move money: confirm with the user first.")
+    def resolve_invoice(invoice_id: int, approve: bool, note: str = "") -> str:
+        def act():
+            who, role = identity()
+            if approve:
+                return {"invoice_id": invoice_id, **review.approve(store, invoice_id, reviewer=who, role=role, note=note,
+                                                                   backend=pipeline.backend, settings=settings)}
+            return {"invoice_id": invoice_id, **review.reject(store, invoice_id, reviewer=who, role=role, note=note, settings=settings)}
+        return guarded(act)
 
     @server.tool(description="Put an invoice awaiting review on hold for investigation. note says what is being checked.")
-    def hold_invoice(invoice_id: int, reviewer: str, note: str, role: str = "vp_finance") -> str:
-        try:
-            return json.dumps({"invoice_id": invoice_id, **review.hold(store, invoice_id, reviewer=reviewer, role=role, note=note, settings=settings)})
-        except review.ReviewError as exc:
-            return json.dumps({"error": str(exc)})
+    def hold_invoice(invoice_id: int, note: str) -> str:
+        def act():
+            who, role = identity()
+            return {"invoice_id": invoice_id, **review.hold(store, invoice_id, reviewer=who, role=role, note=note, settings=settings)}
+        return guarded(act)
 
     @server.tool(description="Reopen a REJECTED invoice a human believes is correct (policy exception; needs a written reason). "
                              "Payment then needs two approvers including the CFO.")
-    def reopen_invoice(invoice_id: int, reviewer: str, reason: str, role: str = "vp_finance") -> str:
-        try:
-            return json.dumps({"invoice_id": invoice_id, **review.reopen(store, invoice_id, reviewer=reviewer, role=role, reason=reason, settings=settings)})
-        except review.ReviewError as exc:
-            return json.dumps({"error": str(exc)})
+    def reopen_invoice(invoice_id: int, reason: str) -> str:
+        def act():
+            who, role = identity()
+            return {"invoice_id": invoice_id, **review.reopen(store, invoice_id, reviewer=who, role=role, reason=reason, settings=settings)}
+        return guarded(act)
 
     @server.tool(description="Ledger summary: counts and dollar totals by outcome, straight-through rate, queue state.")
     def ledger_summary() -> str:

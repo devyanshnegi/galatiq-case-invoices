@@ -37,7 +37,7 @@ def run(*argv) -> int:
     (["--queue", "inbox", "--reset"], ["queue", "run", "inbox", "--fresh"]),
     (["--queue-status"], ["queue", "status"]),
     (["--pending"], ["pending"]),
-    (["--approve", "7", "--reviewer", "Ann", "--note", "ok"], ["approve", "7", "--as", "Ann", "--note", "ok"]),
+    (["--approve", "7", "--reviewer", "Ann Kim", "--note", "ok"], ["approve", "7", "--as", "Ann Kim", "--note", "ok"]),
     (["process", "x"], ["process", "x"]),
 ])
 def test_legacy_flags_translate(old, new):
@@ -65,7 +65,7 @@ def test_dry_run_changes_nothing(env):
     before = (len(env.list_invoices()), len(env.list_payments()))
     assert run("batch", str(DATA), "--fresh", "-y", "--dry-run", "-q") == 0  # even a fresh reprocess
     pending = [r for r in env.list_invoices() if r["status"] == "pending_review"]
-    assert run("approve", str(pending[0]["id"]), "--as", "Dana", "--dry-run") == 0
+    assert run("approve", str(pending[0]["id"]), "--as", "Dana Lee", "--dry-run") == 0
     assert (len(env.list_invoices()), len(env.list_payments())) == before
     assert env.list_approvals(pending[0]["id"]) == [] and env.get_invoice(pending[0]["id"])["status"] == "pending_review"
 
@@ -106,14 +106,14 @@ def test_interactive_rejected_mode_reopens(env):
     from invoice_agents.backends import LocalBackend
 
     with contextlib.redirect_stdout(io.StringIO()):
-        done = review_cli.interactive(env, settings, LocalBackend(settings, env), "Dana", "vp_finance", rejected=True,
+        done = review_cli.interactive(env, settings, LocalBackend(settings, env), "Dana Lee", "vp_finance", rejected=True,
                                       ask=scripted("q"))
         assert done == Counter()
         # first rejected invoice in id order that can be reopened -> reopen it, quit after
         cases = review.list_cases(env, settings.policy, statuses=("rejected",))
         first_reopenable = next(i for i, c in enumerate(cases) if review.why_cannot_reopen(c, settings.policy) is None)
         answers = ["s"] * first_reopenable + ["o", "Stock confirmed delivered from a second warehouse", "q"]
-        done = review_cli.interactive(env, settings, LocalBackend(settings, env), "Dana", "vp_finance", rejected=True, ask=scripted(*answers))
+        done = review_cli.interactive(env, settings, LocalBackend(settings, env), "Dana Lee", "vp_finance", rejected=True, ask=scripted(*answers))
     assert done["pending_review"] == 1
 
 

@@ -24,11 +24,12 @@ from .render import SEVERITY_STYLE, STATUS_STYLE, console, money
 Ask = Callable[..., str]
 
 
-def default_identity() -> tuple[str, str]:
-    """AP_REVIEWER="Dana Lee:vp_finance" saves typing --as/--role on every command."""
+def default_identity() -> tuple[str, str | None]:
+    """AP_REVIEWER="Dana Lee" (or "Dana Lee:vp_finance") saves typing --as on every command.
+    With an approver roster the role comes from the roster, so it can be left out."""
     raw = os.getenv("AP_REVIEWER", "")
     name, _, role = raw.partition(":")
-    return (name.strip() or "cli-user"), (role.strip() or "vp_finance")
+    return (name.strip() or "cli-user"), (role.strip() or None)
 
 
 def _status(status: str) -> str:
@@ -102,7 +103,7 @@ def interactive(store: Store, settings: Settings, backend, reviewer: str, role: 
         console.print("[green]Nothing to review.[/]" if not rejected else "[green]No rejected invoices.[/]")
         return done
     console.print(f"Reviewing as [bold]{reviewer}[/] ({review.ROLES[role]}). {len(ids)} invoice(s). "
-                  "[dim]Change identity with --as/--role or AP_REVIEWER=\"Name:role\".[/]")
+                  "[dim]Change identity with --as NAME or AP_REVIEWER=\"Name\".[/]")
 
     for n, invoice_id in enumerate(ids, start=1):
         while True:

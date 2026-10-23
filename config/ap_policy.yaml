@@ -36,6 +36,15 @@ human_review:                                 # §4.3, §15 [enforced]
     - BANK_DETAILS_CHANGED
     - VENDOR_ADDRESS_MISMATCH
   senior_roles: [vp_finance, cfo]             # a two-person approval must include one of these
+  # Who may act as a reviewer, and in which role. When this list is non-empty, a name not on it can't
+  # approve, reject, hold or reopen, and nobody can pick a role other than their own.
+  # (The prototype has no login; in production this comes from SSO / the HR system.)
+  reviewers:
+    - {name: Dana Lee, role: vp_finance}
+    - {name: Raj Mehta, role: vp_finance}
+    - {name: Sam Patel, role: cfo}
+    - {name: Ann Kim, role: ap_specialist}
+    - {name: Bo Chen, role: department_approver}
   override:                                   # reopening a REJECTED invoice is a policy exception
     approvals_required: 2
     required_role: cfo                        # one of the approvers must be the CFO
@@ -54,7 +63,8 @@ matching:                                     # §5
   po_required_above: 2500                     # [documented]
   three_way_match_for_goods: true             # [documented] planned for agents
   quantity_tolerance_vs_receipt: 0.0          # [documented]
-  freight_tolerance_share_of_goods: 0.05      # [documented]
+  freight_tolerance_share_of_goods: 0.05      # [enforced] shipping above this share of the goods value is a warning
+  max_tax_rate: 0.15                          # [enforced] tax above this share of the subtotal (stated or implied) needs a human
   non_po_categories:                          # [documented]
     - utilities
     - rent
@@ -77,10 +87,13 @@ always_escalate:
   INVOICE_NUMBER_COLLISION: an invoice number reused by a different vendor needs investigation
   THRESHOLD_SPLITTING: near-threshold invoices from one vendor within days may be split to dodge VP review
   EXTRACTION_UNVERIFIED: the extracted data could not be verified against the document - a human must check it
+  MISSING_INVOICE_NUMBER: without an invoice number duplicates can't be detected reliably
+  TAX_RATE_UNUSUAL: tax far above normal rates is a way to overcharge through the tax line
+  FREIGHT_ABOVE_TOLERANCE: freight far above the usual share of the goods value is a way to overcharge
 
 payments:                                     # §12
-  single_payment_limit: 50000                 # [enforced] declined at the bank boundary above this
-  dual_approved_payment_limit: 250000         # [enforced] payments approved by two people may go up to this
+  single_payment_limit: 50000                 # [enforced] USD; declined at the bank boundary above this
+  dual_approved_payment_limit: 250000         # [enforced] USD; payments approved by two people may go up to this
   default_method: ACH                         # [documented]
   wire_allowed_above: 100000                  # [documented]
   forbidden_methods: [gift_card, crypto, personal_account]   # [documented] flagged by fraud checks today

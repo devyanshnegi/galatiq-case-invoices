@@ -59,10 +59,10 @@ def test_human_review_approves_and_pays_once(settings):
     pipeline, results = run_all(settings)
     invoice_id = results["invoice_1014.xml"]["invoice_id"]
     with contextlib.redirect_stdout(io.StringIO()):
-        resolve_pending(pipeline.store, invoice_id, approve=True, reviewer="test", note="FX confirmed")
+        resolve_pending(pipeline.store, invoice_id, approve=True, reviewer="Dana Lee", note="FX confirmed")
     assert pipeline.store.get_invoice(invoice_id)["status"] == "paid"
     try:
-        resolve_pending(pipeline.store, invoice_id, approve=True, reviewer="test")
+        resolve_pending(pipeline.store, invoice_id, approve=True, reviewer="Dana Lee")
         raise AssertionError("second approval should fail")
     except ValueError:
         pass

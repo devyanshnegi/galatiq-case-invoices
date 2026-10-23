@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -33,6 +34,8 @@ ROLES = {
     "cfo": "CFO",
 }
 REVIEWABLE = ("pending_review", "on_hold")
+# Check-then-record-then-pay must be one step: two clicks at once must not both count or both pay.
+_ACTION_LOCK = threading.Lock()
 
 
 class ReviewError(ValueError):
@@ -86,12 +89,13 @@ class ReviewCase:
 
     @property
     def approvers(self) -> list[dict[str, Any]]:
-        """Approvals that still count: only those since the invoice was last (re)opened."""
+        """Approvals that still count: since the last (re)open, and one per person - a second approval
+        by the same person (e.g. two simultaneous clicks, or two processes) never counts twice."""
         current: list[dict[str, Any]] = []
         for event in self.history:
             if event["action"] == "reopen":
                 current = []
-            elif event["action"] == "approve":
+            elif event["action"] == "approve" and not any(_norm(a["reviewer"]) == _norm(event["reviewer"]) for a in current):
                 current.append(event)
         return current
 
@@ -152,20 +156,46 @@ def list_cases(store: Store, policy: PolicySettings, statuses: tuple[str, ...] =
     return [load_case(store, r["id"], policy) for r in sorted(rows, key=lambda r: r["id"])]
 
 
+def roster_role(policy: PolicySettings, reviewer: str) -> str | None:
+    """The role the roster gives this person (None if there's no roster or they're not on it)."""
+    entry = policy.reviewers.get(_norm(reviewer))
+    return entry[1] if entry else None
+
+
+def identity_problem(policy: PolicySettings, reviewer: str, role: str) -> str | None:
+    """With a roster configured, only listed people may act, and only in their own role."""
+    if not reviewer.strip():
+        return "enter your name first"
+    if role not in ROLES:
+        return f"unknown role '{role}'"
+    if not policy.reviewers:
+        return None
+    entry = policy.reviewers.get(_norm(reviewer))
+    if entry is None:
+        return f"'{reviewer}' is not on the approver roster (human_review.reviewers in config/ap_policy.yaml)"
+    if entry[1] != role:
+        return f"{entry[0]} is registered as {ROLES.get(entry[1], entry[1])}, not {ROLES[role]}"
+    return None
+
+
 def why_cannot_approve(case: ReviewCase, reviewer: str, role: str, policy: PolicySettings) -> str | None:
     """None if this person may approve now; otherwise the reason, for the UI to show."""
     if case.status not in REVIEWABLE:
         return f"invoice is {case.status.replace('_', ' ')}, not awaiting review"
     if not reviewer.strip():
         return "enter your name first"
+    # Same-person check first: it's the clearest message when someone tries a second identity.
+    if any(_norm(a["reviewer"]) == _norm(reviewer) for a in case.approvers):
+        return "you already approved this invoice - a different person must give the next approval"
+    problem = identity_problem(policy, reviewer, role)
+    if problem:
+        return problem
     if role not in policy.approver_limits:
-        return f"unknown role '{role}'"
+        return f"the policy gives {ROLES[role]} no approval limit"
     limit = policy.approver_limits[role]
     req = case.requirement
     if req.approvals == 1 and role not in req.authority_roles:
         return f"${case.amount_usd:,.2f} is above the {ROLES[role]} limit of ${limit:,.0f}"
-    if any(_norm(a["reviewer"]) == _norm(reviewer) for a in case.approvers):
-        return "you already approved this invoice - a different person must give the next approval"
     # Two-person cases: anyone may give an earlier approval, but the one that completes the count must
     # leave nothing missing (senior approver, CFO for exceptions, someone with authority for the amount).
     if len(case.approvers) + 1 >= req.approvals and not would_complete(case, role):
@@ -196,6 +226,11 @@ def why_cannot_reopen(case: ReviewCase, policy: PolicySettings) -> str | None:
 
 def approve(store: Store, invoice_id: int, *, reviewer: str, role: str, note: str = "", backend, settings: Settings) -> dict:
     """Record an approval; pay once the requirement is met. Returns {'status', 'message', 'payment'?}."""
+    with _ACTION_LOCK:
+        return _approve(store, invoice_id, reviewer=reviewer, role=role, note=note, backend=backend, settings=settings)
+
+
+def _approve(store: Store, invoice_id: int, *, reviewer: str, role: str, note: str, backend, settings: Settings) -> dict:
     case = load_case(store, invoice_id, settings.policy)
     reason = why_cannot_approve(case, reviewer, role, settings.policy)
     if reason:
@@ -209,28 +244,32 @@ def approve(store: Store, invoice_id: int, *, reviewer: str, role: str, note: st
             store.update_invoice_status(invoice_id, "pending_review", "escalate", case.row["reasoning"])
         return {"status": "awaiting_approval", "message": "Approval recorded. Still needed: " + "; ".join(still) + "."}
 
+    from .agents.payment import apply_payment_outcome, execute_payment
+
     inv = case.invoice
-    payment = backend.pay(invoice_id=invoice_id, invoice_number=inv.invoice_number, vendor=inv.vendor, amount=inv.total,
-                          currency=inv.currency, dual_approved=case.requirement.approvals >= 2)
+    payment = execute_payment(store, backend, invoice_id, inv, dual_approved=case.requirement.approvals >= 2)
     names = " and ".join(f"{a['reviewer']} ({ROLES.get(a['role'], a['role'])})" for a in case.approvers)
     summary = f"Approved by {names}" + (f": {note}" if note else "") + f" (agent said: {case.row['reasoning']})"
-    if payment["status"] in ("success", "skipped"):
-        store.update_invoice_status(invoice_id, "paid", "approve", summary)
+    status = apply_payment_outcome(store, invoice_id, payment, "approve", summary)
+    if status == "paid":
         _remember(store, case, "approve", note, reviewer)
-        return {"status": "paid", "message": f"Paid. Reference {payment.get('reference')}.", "payment": payment}
-    if payment["status"] == "declined":
-        store.update_invoice_status(invoice_id, "pending_review", "escalate", f"{summary} - bank declined: {payment['reason']}")
-        return {"status": "declined", "message": f"Approved, but the bank declined: {payment['reason']}", "payment": payment}
-    store.update_invoice_status(invoice_id, "failed", "approve", f"{summary} - payment failed: {payment}")
-    return {"status": "failed", "message": f"Payment failed: {payment}", "payment": payment}
+        detail = payment.get("note") or payment.get("reason") or ""
+        ref = f" Reference {payment['reference']}." if payment.get("reference") else ""
+        return {"status": "paid", "message": f"Paid.{ref}" + (f" ({detail})" if detail else ""), "payment": payment}
+    if status == "pending_review":
+        return {"status": "declined", "message": f"Approved, but the bank declined: {payment.get('reason')}", "payment": payment}
+    return {"status": "failed", "message": f"Payment not confirmed: {payment.get('reason') or payment}", "payment": payment}
 
 
 def reject(store: Store, invoice_id: int, *, reviewer: str, role: str, note: str = "", settings: Settings) -> dict:
     case = load_case(store, invoice_id, settings.policy)
     if case.status not in REVIEWABLE:
         raise ReviewError(f"invoice is {case.status.replace('_', ' ')}, not awaiting review")
-    if not reviewer.strip():
-        raise ReviewError("enter your name first")
+    problem = identity_problem(settings.policy, reviewer, role)
+    if problem:
+        raise ReviewError(problem)
+    if not note.strip():
+        raise ReviewError("give a reason for rejecting - it goes back to the vendor and into the audit trail")
     store.add_approval(invoice_id=invoice_id, reviewer=reviewer.strip(), role=role, action="reject", note=note)
     store.update_invoice_status(invoice_id, "rejected", "reject",
                                 f"Rejected by {reviewer} ({ROLES.get(role, role)})" + (f": {note}" if note else "")
@@ -247,7 +286,10 @@ def hold(store: Store, invoice_id: int, *, reviewer: str, role: str, note: str, 
         raise ReviewError("only invoices awaiting review can be put on hold")
     if not note.strip():
         raise ReviewError("say what is being investigated")
-    store.add_approval(invoice_id=invoice_id, reviewer=reviewer.strip() or "unknown", role=role, action="hold", note=note)
+    problem = identity_problem(settings.policy, reviewer, role)
+    if problem:
+        raise ReviewError(problem)
+    store.add_approval(invoice_id=invoice_id, reviewer=reviewer.strip(), role=role, action="hold", note=note)
     store.update_invoice_status(invoice_id, "on_hold", "escalate", case.row["reasoning"])
     _audit(store, case, "on_hold", reviewer, role, note)
     return {"status": "on_hold", "message": "On hold for investigation."}
@@ -261,13 +303,16 @@ def reopen(store: Store, invoice_id: int, *, reviewer: str, role: str, reason: s
         raise ReviewError(blocked)
     if len(reason.strip()) < 10:
         raise ReviewError("write a justification (at least a sentence) - it goes in the audit trail")
+    problem = identity_problem(settings.policy, reviewer, role)
+    if problem:
+        raise ReviewError(problem)
     try:
         store.update_invoice_status(invoice_id, "pending_review", "escalate",
                                     f"Reopened by {reviewer} ({ROLES.get(role, role)}): {reason} (agent rejected it: {case.row['reasoning']})")
     except sqlite3.IntegrityError as exc:
         raise ReviewError("another copy of this invoice is already approved, paid or in review") from exc
     store.set_override(invoice_id, reason)
-    store.add_approval(invoice_id=invoice_id, reviewer=reviewer.strip() or "unknown", role=role, action="reopen", note=reason)
+    store.add_approval(invoice_id=invoice_id, reviewer=reviewer.strip(), role=role, action="reopen", note=reason)
     case = load_case(store, invoice_id, settings.policy)
     _audit(store, case, "reopened", reviewer, role, reason)
     return {"status": "pending_review", "message": "Reopened for review. Payment needs: " + "; ".join(case.missing()) + "."}

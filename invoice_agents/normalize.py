@@ -67,14 +67,19 @@ def parse_date(value) -> str | None:
 
 
 def normalize_invoice_number(value) -> str | None:
-    """'1002', 'INV 1012', 'inv-1003' -> 'INV-1002', 'INV-1012', 'INV-1003'."""
+    """'1002', 'INV 1012', 'inv-1003' -> 'INV-1002', 'INV-1012', 'INV-1003'. Other schemes keep every
+    character that distinguishes them: '2026-0001' and '2026-0002' must stay different invoices."""
     if value is None:
         return None
-    text = fix_ocr_digits(str(value)).strip()
-    match = re.search(r"(\d{3,})", text)
-    if not match:
-        return text or None
-    return f"INV-{match.group(1)}"
+    text = fix_ocr_digits(str(value)).strip().upper()
+    if not text:
+        return None
+    if re.fullmatch(r"\d+", text):
+        return f"INV-{text}"
+    match = re.fullmatch(r"INV(?:OICE)?[\s#:._-]*(?:NO\.?|NUMBER)?[\s#:._-]*(\w[\w-]*)", text)
+    if match:
+        return f"INV-{match.group(1)}"
+    return re.sub(r"[\s#:._]+", "-", text).strip("-")
 
 
 def parse_terms_days(terms: str | None) -> int | None:

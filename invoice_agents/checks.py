@@ -90,6 +90,9 @@ def check_line_items(inv: Invoice, store: Store, policy: PolicySettings) -> list
             issues.append(Issue(code="FRACTIONAL_QUANTITY", severity=W, field=f"line_items[{n}]", message=f"{label}: fractional quantity {li.quantity:g}."))
         if li.unit_price is not None and li.unit_price < 0:
             issues.append(Issue(code="NEGATIVE_PRICE", severity=E, field=f"line_items[{n}]", message=f"{label}: negative unit price."))
+        if li.unit_price is None and li.amount is None:
+            issues.append(Issue(code="MISSING_PRICE", severity=E, field=f"line_items[{n}]",
+                                message=f"{label}: no unit price or line amount - the total can't be verified."))
 
         row = store.match_item(li.item)
         if row is None:
@@ -103,15 +106,19 @@ def check_line_items(inv: Invoice, store: Store, policy: PolicySettings) -> list
             requested[row["item"]] += li.quantity
 
         catalog_price = row["unit_price"] or 0
-        if li.unit_price is not None and catalog_price > 0 and inv.currency == policy.base_currency:
-            delta = (li.unit_price - catalog_price) / catalog_price
+        # Use the stated unit price, or derive it from the line amount when only that is given.
+        unit_price = li.unit_price
+        if unit_price is None and li.amount is not None and li.quantity:
+            unit_price = (li.amount + (li.discount or 0)) / li.quantity
+        if unit_price is not None and catalog_price > 0 and inv.currency == policy.base_currency:
+            delta = (unit_price - catalog_price) / catalog_price
             if delta > policy.price_variance_tolerance:
                 issues.append(Issue(code="PRICE_ABOVE_CATALOG", severity=W, field=f"line_items[{n}]",
-                                    message=f"{label}: ${li.unit_price:,.2f} is {delta:+.0%} vs catalog ${catalog_price:,.2f}"
+                                    message=f"{label}: ${unit_price:,.2f} is {delta:+.0%} vs catalog ${catalog_price:,.2f}"
                                             + (f" (invoice note: '{li.note}')" if li.note else "") + "."))
             elif delta < -policy.price_variance_tolerance:
                 issues.append(Issue(code="PRICE_BELOW_CATALOG", severity=I, field=f"line_items[{n}]",
-                                    message=f"{label}: ${li.unit_price:,.2f} is {delta:+.0%} vs catalog - discount."))
+                                    message=f"{label}: ${unit_price:,.2f} is {delta:+.0%} vs catalog - discount."))
 
     for sku, qty in requested.items():
         row = catalog[sku]
@@ -134,7 +141,10 @@ def check_arithmetic(inv: Invoice) -> list[Issue]:
     computable = bool(inv.line_items)
     for n, li in enumerate(inv.line_items, start=1):
         if li.quantity is None or li.unit_price is None:
-            computable = False
+            if li.amount is None:
+                computable = False  # MISSING_PRICE / MISSING_QUANTITY already block it
+            else:
+                line_sum += li.amount  # amount-only line: can't check the line, but it still counts toward the total
             continue
         discount = li.discount or 0.0
         expected = round(li.quantity * li.unit_price - discount, 2)
@@ -166,11 +176,33 @@ def check_arithmetic(inv: Invoice) -> list[Issue]:
     return issues
 
 
+def check_charges(inv: Invoice, policy: PolicySettings) -> list[Issue]:
+    """Tax and freight that add up can still be inflated: compare them with what's plausible."""
+    issues: list[Issue] = []
+    goods = inv.subtotal if inv.subtotal is not None else sum(li.amount or 0 for li in inv.line_items) or None
+    if not goods or goods <= 0:
+        return issues
+    implied = (inv.tax or 0) / goods
+    rate = max(implied, inv.tax_rate or 0)
+    if rate > policy.max_tax_rate + 1e-9:
+        issues.append(Issue(code="TAX_RATE_UNUSUAL", severity=W, field="tax",
+                            message=f"Tax is {rate:.1%} of the goods value (${inv.tax or 0:,.2f} on ${goods:,.2f}); "
+                                    f"the policy maximum is {policy.max_tax_rate:.0%}."))
+    if inv.shipping and inv.shipping / goods > policy.freight_tolerance + 1e-9:
+        issues.append(Issue(code="FREIGHT_ABOVE_TOLERANCE", severity=W, field="shipping",
+                            message=f"Shipping ${inv.shipping:,.2f} is {inv.shipping / goods:.1%} of the goods value; "
+                                    f"tolerance is {policy.freight_tolerance:.0%}."))
+    return issues
+
+
 def check_dates(inv: Invoice, today: date | None = None, terms_tolerance_days: int = TERMS_TOLERANCE_DAYS) -> list[Issue]:
     issues: list[Issue] = []
     today = today or date.today()
     if not inv.invoice_date:
         issues.append(Issue(code="MISSING_INVOICE_DATE", severity=W, field="invoice_date", message="Invoice date missing."))
+    elif date.fromisoformat(inv.invoice_date) > today:
+        issues.append(Issue(code="FUTURE_DATED_INVOICE", severity=W, field="invoice_date",
+                            message=f"Invoice is dated {inv.invoice_date}, in the future - billing before supply?"))
     if not inv.due_date:
         return issues
     due = date.fromisoformat(inv.due_date)
@@ -200,11 +232,20 @@ def check_vendor(inv: Invoice, store: Store) -> list[Issue]:
     if match == "fuzzy":
         issues.append(Issue(code="VENDOR_NAME_VARIANT", severity=W, field="vendor",
                             message=f"'{inv.vendor}' closely resembles approved vendor '{row['name']}' - confirm it's the same entity."))
+    elif match == "suffix":
+        issues.append(Issue(code="VENDOR_NAME_VARIANT", severity=W, field="vendor",
+                            message=f"'{inv.vendor}' has a different legal form from approved vendor '{row['name']}' - "
+                                    "a different company with a similar name is a classic impersonation."))
     elif match == "alias":
         issues.append(Issue(code="VENDOR_ALIAS", severity=I, field="vendor", message=f"'{inv.vendor}' is a known alias of '{row['name']}'."))
-    if inv.vendor_address and row.get("address") and normalize_name(inv.vendor_address) != normalize_name(row["address"]):
+    on_file = row.get("address")
+    for label, address in (("Vendor address", inv.vendor_address), ("Remit-to address", inv.remit_to_address)):
+        if address and on_file and normalize_name(address) != normalize_name(on_file):
+            issues.append(Issue(code="VENDOR_ADDRESS_MISMATCH", severity=W, field="vendor_address",
+                                message=f"{label} '{address}' differs from the address on file '{on_file}'."))
+    if inv.remit_to_address and not on_file and inv.vendor_address and normalize_name(inv.remit_to_address) != normalize_name(inv.vendor_address):
         issues.append(Issue(code="VENDOR_ADDRESS_MISMATCH", severity=W, field="vendor_address",
-                            message=f"Remit address '{inv.vendor_address}' differs from address on file '{row['address']}'."))
+                            message=f"Payment is to be sent to '{inv.remit_to_address}', not the vendor's own address '{inv.vendor_address}'."))
     return issues
 
 
@@ -300,7 +341,7 @@ def check_threshold_splitting(inv: Invoice, store: Store, policy: PolicySettings
 
 # ---- orchestration --------------------------------------------------------------------------
 
-CHECKS = ["required_fields", "line_items_and_stock", "arithmetic", "dates", "vendor", "currency", "duplicates", "fraud_signals",
+CHECKS = ["required_fields", "line_items_and_stock", "arithmetic", "charges", "dates", "vendor", "currency", "duplicates", "fraud_signals",
           "prompt_injection", "threshold_splitting"]
 
 
@@ -309,6 +350,7 @@ def run_all_checks(inv: Invoice, raw_text: str, store: Store, policy: PolicySett
         *check_required_fields(inv),
         *check_line_items(inv, store, policy),
         *check_arithmetic(inv),
+        *check_charges(inv, policy),
         *check_dates(inv, today, policy.terms_tolerance_days),
         *check_vendor(inv, store),
         *check_currency(inv, policy),

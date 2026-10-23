@@ -149,6 +149,13 @@ def extraction_problems(inv: Invoice, raw_text: str) -> list[str]:
         problems.append("total is missing")
     elif not _number_in_text(abs(inv.total), text):
         problems.append(f"total {inv.total} does not appear anywhere in the document")
+    # Currency: a misread currency would skip the FX escalation and pay the wrong amount.
+    markers = {"EUR": r"€|\bEUR\b", "GBP": r"£|\bGBP\b", "CAD": r"\bCAD\b|C\$"}
+    present = {code for code, pattern in markers.items() if re.search(pattern, raw_text)}
+    if (inv.currency or "USD") == "USD" and present and "$" not in raw_text.replace("C$", ""):
+        problems.append(f"currency extracted as USD but the document shows {', '.join(sorted(present))}")
+    elif (inv.currency or "USD") != "USD" and inv.currency in markers and inv.currency not in present:
+        problems.append(f"currency extracted as {inv.currency} but the document doesn't mention it")
     if inv.due_date is None and not inv.due_date_raw:
         problems.append("due_date and due_date_raw are both empty - copy whatever the document says about the due date")
     for n, li in enumerate(inv.line_items, start=1):

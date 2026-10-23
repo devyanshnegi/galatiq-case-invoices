@@ -24,6 +24,7 @@ class Invoice(BaseModel):
     invoice_number: str | None = Field(default=None, description="Invoice number, e.g. 'INV-1002'")
     vendor: str | None = Field(default=None, description="Name of the company that issued the invoice (the seller, not Acme Corp)")
     vendor_address: str | None = None
+    remit_to_address: str | None = Field(default=None, description="'Remit to' / pay-to address if different from the vendor address")
     invoice_date: str | None = Field(default=None, description="Invoice date as YYYY-MM-DD. null if missing or unreadable.")
     due_date: str | None = Field(default=None, description="Due date as YYYY-MM-DD. null if missing or not an actual date.")
     due_date_raw: str | None = Field(default=None, description="Due date text exactly as written, e.g. 'yesterday'")

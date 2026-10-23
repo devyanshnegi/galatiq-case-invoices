@@ -44,7 +44,7 @@ python main.py doctor                # check the setup
 python main.py batch                 # process every sample, print a summary
 streamlit run app.py                 # dashboard: live agent steps, review queue, operations, ledger
 python -m invoice_agents.loadtest    # 1,000 synthetic invoices, scored against ground truth
-pytest                               # 181 tests
+pytest                               # 209 tests
 ```
 
 No model or API key is needed to try it. If the configured LLM isn't reachable, the agents fall back to deterministic rules and say so. The database (`inventory.db`) is created and seeded automatically on first run. Run `python -m invoice_agents.db --reset` to recreate it.
@@ -137,7 +137,7 @@ The dashboard is built around the people who own the decisions:
 - **Two-person rule.** Large invoices (≥ $50K) and bank or remit-address changes need **two different people** before money moves: one senior, and one whose approval limit covers the amount. The button tells you whether your click pays or records "1 of 2". If your approval isn't allowed, it says why: over your limit, already approved by you, or a CFO sign-off still needed.
 - **Rejected tab.** If a person believes a rejected invoice is actually correct, they can **reopen** it with a written justification. Payment then needs two approvers including the CFO. Duplicates and prompt-injection attacks can never be reopened.
 - **Payments tab.** Every payment with **who authorised it** (agents or named people, single or two-person), plus a downloadable payment register.
-- **Roles and limits** come from `config/ap_policy.yaml`: AP specialist $10K, VP Finance $50K, CFO unlimited. You pick your name and role in the sidebar. A real deployment would use SSO.
+- **Roles and limits** come from `config/ap_policy.yaml`: AP specialist $10K, VP Finance $50K, CFO unlimited. You pick your name from the **approver roster** in the sidebar, and your role comes with it. A real deployment would use SSO.
 
 The same rules apply from the CLI (`--approve/--reject/--hold/--reopen ID --reviewer NAME --role ROLE`) and the `acme-ap` MCP server. All three call one review engine, `invoice_agents/review.py`.
 
@@ -237,11 +237,12 @@ python main.py approve 14 --note "PO amendment confirmed"     # also: reject | h
 python main.py approve 14 --dry-run           # would this approval pay, or still need a second approver?
 python main.py payments --csv register.csv    # payment register with who authorised each payment
 python main.py policy                         # the policy in force, where each value comes from, any mistakes
+python main.py reconcile                      # finish payments a crash left unconfirmed; list unknown bank outcomes
 ```
 
 Engine options work on any command that runs the agents: `--provider ollama`, `--model ...`, `--backend mcp`, `--no-fast-path`.
 
-Set your reviewer identity once with `AP_REVIEWER="Dana Lee:vp_finance"` instead of `--as "Dana Lee" --role vp_finance` on every command.
+Set your reviewer identity once with `AP_REVIEWER="Dana Lee"` instead of `--as "Dana Lee"` on every command. Your role comes from the approver roster in `config/ap_policy.yaml`.
 
 **Dry run** copies the ledger to a temporary file and runs exactly the same logic there, so the findings, decisions and "would pay" totals are real. Afterwards the copy is thrown away: nothing is written and nothing is paid.
 
@@ -276,7 +277,7 @@ invoice_agents/
   review.py                 human review engine: roles, limits, two-person rule, hold, reject, reopen
   db.py                     SQLite (WAL): inventory, vendors, invoices, payments, approvals, jobs, human decisions, audit log
   models.py · prompts.py · config.py · normalize.py · state.py
-tests/                      181 tests, incl. scripted-LLM tests of every agentic loop
+tests/                      209 tests, incl. scripted-LLM tests of every agentic loop
 data/invoices/              the provided samples
 data/adversarial/           prompt injection, bank change, remit change, split invoices, scanned PDF
 data/templates/             invoice_template.json: every field a complete invoice can carry
@@ -305,6 +306,30 @@ pytest -q
 - **Scale**: concurrent batches match sequential results; 12 racing copies of one invoice are paid exactly once; queue dedupe, retries, permanent failures and crash recovery (including finishing a payment interrupted mid-flight); bank idempotency and limits; a 150-invoice synthetic load test must score 100% with zero wrongly paid.
 - **MCP**: tools discovered and called over the protocol, the full pipeline on the MCP backend, real stdio server processes, and the `acme-ap` server running the whole workflow, including refusing paths outside the project.
 - **Adversarial and learning**: injection blocked even when the model falls for it, bank and remit changes held, split invoices held, precedents learned but never overriding policy, unverified extractions escalated, and second-opinion rescue.
+
+## Security review
+
+A full review of every module looked for ways money could be paid wrongly. Each finding below is fixed and has a regression test in `tests/test_loopholes.py`.
+
+| Area | Loophole | Fix |
+|---|---|---|
+| Bank | Limits compared raw amounts with USD limits, so a €49,000 invoice (~$52,900) passed a $50K limit | Limits are checked in USD at the treasury rate; unknown currencies are declined |
+| Bank | A crash mid-payment, or an unclear bank answer, could be retried into a double payment or recorded as "paid" when no money moved | Unknown outcomes keep the payment slot locked and are flagged; `reconcile` and `doctor` find them |
+| Review | Anyone could pick any role ("I'm the CFO") | An approver roster in the policy: only listed people, only in their own role |
+| Review | One person could count twice (two simultaneous clicks) | Approvals count once per person; approve-and-pay is a single locked step |
+| Review | Approving a revision paid the full amount on top of the original | Revisions pay only the difference |
+| MCP | An AI client could approve twice under two names | The MCP server acts as one configured person, and its tools take no name |
+| Checks | Inflated tax or freight passed when the totals added up | Tax ceiling (15%) and freight tolerance (5%) |
+| Checks | Lines without prices disabled the total check | Missing prices are rejected; amount-only lines still count toward the total |
+| Checks | "Widgets LLC" matched approved vendor "Widgets Inc." | A different legal form is treated as a look-alike vendor |
+| Checks | The remit-to address was never compared | Remit-to is parsed and checked against the vendor master |
+| Checks | Numberless invoices escaped duplicate detection | They always go to a human |
+| Checks | Invoice numbers like 2026-0001 / 2026-0002 collapsed to one | Normalization keeps distinguishing characters |
+| AI | A misread currency (€ read as $) skipped the FX escalation | The extraction self-check verifies the currency against the document |
+| CLI | `reset` in a script cleared the ledger without asking | Refuses without `--yes` when there's no terminal |
+| Ledger | A crash in batch mode left invoices "approved" but unpaid, invisible to review | `python main.py reconcile` finishes them; `doctor` reports them |
+
+**Known limitation:** the prototype has no login. The roster restricts who may act and in which role, but it can't stop someone choosing another person's name. Production needs SSO.
 
 ## Assumptions and scope cuts
 

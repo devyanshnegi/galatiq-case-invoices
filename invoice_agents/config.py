@@ -52,6 +52,9 @@ DEFAULT_ALWAYS_ESCALATE = {
     "BANK_DETAILS_CHANGED": "a request to pay new bank details must be verified out-of-band before any payment",
     "THRESHOLD_SPLITTING": "near-threshold invoices from one vendor within days may be split to dodge VP review",
     "EXTRACTION_UNVERIFIED": "the extracted data could not be verified against the document - a human must check it",
+    "MISSING_INVOICE_NUMBER": "without an invoice number duplicates can't be detected reliably",
+    "TAX_RATE_UNUSUAL": "tax far above normal rates is a way to overcharge through the tax line",
+    "FREIGHT_ABOVE_TOLERANCE": "freight far above the usual share of the goods value is a way to overcharge",
 }
 DEFAULT_FX = {"USD": 1.0, "EUR": 1.08, "GBP": 1.27, "CAD": 0.73}
 DEFAULT_APPROVER_LIMITS = {"ap_specialist": 10_000.0, "department_approver": 10_000.0, "vp_finance": 50_000.0, "cfo": None}
@@ -79,6 +82,9 @@ class PolicySettings:
     override_approvals: int = 2
     override_required_role: str = "cfo"
     not_overridable: tuple[str, ...] = ("DUPLICATE_INVOICE", "PROMPT_INJECTION")
+    reviewers: dict[str, tuple[str, str]] = field(default_factory=dict)  # normalised name -> (display name, role)
+    max_tax_rate: float = 0.15
+    freight_tolerance: float = 0.05
     policy_id: str = "FIN-AP-001"
     version: str = "builtin"
 
@@ -161,6 +167,10 @@ def load_settings(**overrides) -> Settings:
         override_approvals=int(_get(pf, "human_review.override.approvals_required", 2)),
         override_required_role=str(_get(pf, "human_review.override.required_role", "cfo")),
         not_overridable=tuple(_get(pf, "human_review.override.not_overridable", ["DUPLICATE_INVOICE", "PROMPT_INJECTION"])),
+        reviewers={" ".join(str(r["name"]).lower().split()): (str(r["name"]), str(r["role"]))
+                   for r in _get(pf, "human_review.reviewers", []) or []},
+        max_tax_rate=float(_get(pf, "matching.max_tax_rate", 0.15)),
+        freight_tolerance=float(_get(pf, "matching.freight_tolerance_share_of_goods", 0.05)),
         policy_id=str(_get(pf, "policy.id", "FIN-AP-001")),
         version=str(_get(pf, "policy.version", "builtin")),
     )

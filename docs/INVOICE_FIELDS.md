@@ -38,7 +38,7 @@ The template runs through the system today: `python main.py --invoice_path=data/
 | `vendor.company_registration_number`, `duns_number` | Optional | `IL-5521873` | KYC for new vendors; cross-check with the master | 🔜 |
 | `vendor.address` | Should | `100 Main St, Chicago, IL 60601` | Changed address means escalation (`VENDOR_ADDRESS_MISMATCH`) | ✅ |
 | `vendor.address_structured` | Optional | city, region, postal code, country | Country checks (sanctions, cross-border tax) without parsing free text | 🔜 |
-| `vendor.remit_to` | Should | name + address | **Remit-to differing from the vendor master is the #1 payment-redirection signal** | 🔜 |
+| `vendor.remit_to` | Should | name + address | **Remit-to differing from the vendor master is the #1 payment-redirection signal** | ✅ |
 | `vendor.contact` | Optional | name, email, phone | Email domain matches the vendor's known domain; who to call for out-of-band verification | 🔜 |
 
 ## 3. Buyer (Acme)
@@ -79,7 +79,7 @@ The template runs through the system today: `python main.py --invoice_path=data/
 | `description` | Optional | `Standard widget, type A` | Fallback for item matching | ✅ fallback |
 | `quantity` | **Yes** | `10` | Positive; within stock (aggregated across lines); within the PO quantity | ✅ |
 | `unit_of_measure` | Should | `EA`, `BOX`, `KG` | **Unit mismatch** (billing per box at a per-each price) is a common overcharge | 🔜 |
-| `unit_price` | **Yes** | `250.00` | Price vs. catalog (±10%); vs. PO/contract price once those are linked | ✅ |
+| `unit_price` | **Yes** (or `amount`) | `250.00` | Price vs. catalog (±10%); vs. PO/contract price once those are linked. A line with neither a unit price nor an amount is rejected. | ✅ |
 | `discount_amount` / `discount_percent` | Optional | `100.00` / `0.05` | Line maths includes the discount; discount can't exceed the line value | ✅ |
 | `amount` | Should | `1900.00` | qty × price − discount = amount | ✅ |
 | `tax_code`, `tax_rate`, `tax_amount` (per line) | Optional | `TX-STD`, `0.0825` | Per-line tax adds up to the tax summary; exempt items not taxed | 🔜 |
@@ -93,7 +93,7 @@ The template runs through the system today: `python main.py --invoice_path=data/
 
 | Field | Required | Example | Validation it enables | Status |
 |---|---|---|---|---|
-| `shipping` / `charges[]` | Optional | freight `150.00` | Included in the total check; freight allowed by Incoterms; `taxable` flag respected | ✅ shipping / 🔜 others |
+| `shipping` / `charges[]` | Optional | freight `150.00` | Included in the total check; freight above [5%] of goods is flagged; freight allowed by Incoterms; `taxable` flag respected | ✅ shipping / 🔜 others |
 | `invoice_discounts[]` | Optional | — | Invoice-level discounts in the total check | 🔜 |
 | `tax_rate`, `tax_amount` | Should | `0.0825`, `486.75` | Tax = rate × subtotal (`TAX_MISMATCH`) | ✅ |
 | `tax_summary[]` | Optional | by jurisdiction | Sum of jurisdictions equals the tax total; rate valid for the ship-to jurisdiction | 🔜 |
@@ -135,6 +135,6 @@ The template runs through the system today: `python main.py --invoice_path=data/
 These four would add the most validation value next:
 
 1. **Three-way match.** Add `purchase_orders` and `goods_receipts` tables; check `purchase_order_number` and `po_line_number` against them. This blocks the biggest class of AP loss: paying for things never ordered or never received.
-2. **Structured bank and remit-to verification.** Store each vendor's bank (last 4, routing) and remit-to address in the vendor master. Compare against `payment.bank` and `vendor.remit_to`, not just keywords.
+2. **Structured bank verification.** Store each vendor's bank (last 4, routing) in the vendor master and compare it against `payment.bank`, not just keywords. The remit-to address is already compared.
 3. **Pay `balance_due` and schedule by terms.** Pay the outstanding amount on the optimal date, taking early-payment discounts.
 4. **Vendor tax ID and vendor ID match.** Cheap to add, and very effective against impersonation.

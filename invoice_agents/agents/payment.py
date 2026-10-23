@@ -16,9 +16,63 @@ log = logging.getLogger(__name__)
 STATUS_FOR_DECISION = {"approve": "paid", "reject": "rejected", "escalate": "pending_review"}
 
 
-def execute_payment(backend, invoice_id: int, inv: Invoice) -> dict:
-    return backend.pay(invoice_id=invoice_id, invoice_number=inv.invoice_number, vendor=inv.vendor,
-                       amount=inv.total, currency=inv.currency)
+def amount_due(store: Store, inv: Invoice, invoice_id: int) -> tuple[float, float]:
+    """(amount to pay now, already paid). A revision of an invoice that was already paid owes only the difference."""
+    already = store.paid_against(inv.invoice_number, inv.vendor, invoice_id)
+    return round((inv.total or 0) - already, 2), already
+
+
+def execute_payment(store: Store, backend, invoice_id: int, inv: Invoice, dual_approved: bool = False) -> dict:
+    due, already = amount_due(store, inv, invoice_id)
+    if already and due <= 0:
+        return {"status": "skipped", "reason": f"nothing further due: {already:,.2f} already paid under {inv.invoice_number}"}
+    payment = backend.pay(invoice_id=invoice_id, invoice_number=inv.invoice_number, vendor=inv.vendor, amount=due,
+                          currency=inv.currency, dual_approved=dual_approved)
+    if already:
+        payment["note"] = f"paid the difference: {inv.total:,.2f} less {already:,.2f} already paid under {inv.invoice_number}"
+    return payment
+
+
+def apply_payment_outcome(store: Store, invoice_id: int, payment: dict, decision: str, reasoning: str) -> str:
+    """Write the ledger status for a payment attempt; returns it. Unknown outcomes are flagged, never assumed."""
+    if payment["status"] in ("success", "skipped"):
+        status = "paid"
+        text = reasoning + (f" [{payment['note']}]" if payment.get("note") else "")
+    elif payment["status"] == "declined":
+        status, decision, text = "pending_review", "escalate", f"{reasoning} - bank declined: {payment.get('reason')}"
+    elif payment["status"] == "unknown":
+        status, text = "failed", f"{reasoning} - PAYMENT OUTCOME UNKNOWN: {payment.get('reason')}. Run `python main.py reconcile`."
+    else:
+        status, text = "failed", f"{reasoning} - payment failed: {payment}"
+    store.update_invoice_status(invoice_id, status, decision, text)
+    return status
+
+
+def settle_unconfirmed(store: Store, backend, older_than_s: float = 300) -> list[dict]:
+    """After a crash, in any mode: finish payments for invoices left 'approved', and list unknown outcomes.
+
+    'approved' with no bank claim -> the bank was never called: pay now (idempotent).
+    'approved' with a successful payment -> the crash hit after paying: just mark it paid.
+    An unknown-outcome claim -> left alone and reported: a person must check with the bank.
+    """
+    import json
+
+    report = []
+    found = store.unsettled(older_than_s)
+    for row in found["approved_unpaid"]:
+        inv = Invoice(**json.loads(row["result_json"])["invoice"])
+        existing = store.payment_for_invoice(row["id"])
+        if existing and existing["status"] == "success":
+            store.update_invoice_status(row["id"], "paid", "approve", row["reasoning"])
+            report.append({"invoice_id": row["id"], "invoice_number": inv.invoice_number, "outcome": "already paid - marked paid"})
+            continue
+        payment = execute_payment(store, backend, row["id"], inv)
+        status = apply_payment_outcome(store, row["id"], payment, "approve", row["reasoning"])
+        report.append({"invoice_id": row["id"], "invoice_number": inv.invoice_number, "outcome": status, "payment": payment})
+    for p in found["unknown_payments"]:
+        report.append({"invoice_id": p["invoice_id"], "invoice_number": p["invoice_number"], "outcome": "needs bank reconciliation",
+                       "payment": p})
+    return report
 
 
 def payment_node(ctx: AgentContext):
@@ -28,6 +82,7 @@ def payment_node(ctx: AgentContext):
         decision = dict(state["decision"])
         status = STATUS_FOR_DECISION[decision["decision"]]
         events = []
+        validation = dict(state["validation"])
         try:
             with ctx.ledger_lock:
                 # Re-check the ledger at write time: with parallel workers, another copy or version of this
@@ -35,7 +90,6 @@ def payment_node(ctx: AgentContext):
                 seen = {i["code"] for i in state["validation"]["issues"]}
                 late = [i for i in [*check_duplicates(inv, ctx.store), *check_threshold_splitting(inv, ctx.store, ctx.settings.policy)]
                         if i.severity != Severity.INFO and i.code not in seen]
-                validation = dict(state["validation"])
                 if late and status != "rejected":
                     blocking = any(i.severity == Severity.ERROR for i in late)
                     status = "rejected" if blocking else "pending_review"
@@ -54,22 +108,18 @@ def payment_node(ctx: AgentContext):
                 initial = "approved" if status == "paid" else status
                 invoice_id = ctx.store.record_invoice(status=initial, decision=decision["decision"], reasoning=decision["reasoning"], **record)
         except DuplicateRecord:  # backstop for multiple processes sharing one database
-            # Another worker recorded this exact invoice between our duplicate check and now.
+            # Another copy of this exact invoice is already approved, paid or in review.
             status = "rejected"
             decision.update(decision="reject", override="database duplicate guard",
-                            reasoning=f"{inv.invoice_number} is a duplicate: an identical invoice was recorded concurrently by another worker.")
+                            reasoning=f"{inv.invoice_number} is a duplicate: an identical invoice is already approved, paid or in review.")
+            validation["issues"] = [*validation["issues"], {"code": "DUPLICATE_INVOICE", "severity": "error", "field": "invoice_number",
+                                                            "message": decision["reasoning"]}]
+            record["result"] = {**record["result"], "decision": decision, "validation": validation}
             invoice_id = ctx.store.record_invoice(status=status, decision="reject", reasoning=decision["reasoning"],
                                                   **{**record, "fingerprint": None})
         if status == "paid":
-            payment = execute_payment(ctx.backend, invoice_id, inv)
-            if payment["status"] in ("success", "skipped"):
-                ctx.store.update_invoice_status(invoice_id, "paid", decision["decision"], decision["reasoning"])
-            elif payment["status"] == "declined":
-                status = "pending_review"
-                ctx.store.update_invoice_status(invoice_id, status, "escalate", f"Bank declined: {payment['reason']}")
-            elif payment["status"] not in ("success", "skipped"):
-                status = "failed"
-                ctx.store.update_invoice_status(invoice_id, status, decision["decision"], f"Payment failed: {payment}")
+            payment = execute_payment(ctx.store, ctx.backend, invoice_id, inv)
+            status = apply_payment_outcome(ctx.store, invoice_id, payment, decision["decision"], decision["reasoning"])
             events.append(trace_event("payment", "payment_executed", started, invoice_id=invoice_id, backend=ctx.backend.name, **payment))
         elif status == "rejected":
             payment = {"status": "not_paid", "reason": decision["reasoning"]}

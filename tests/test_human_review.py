@@ -59,7 +59,7 @@ def test_role_limit_blocks_single_approval(pipeline, tmp_path):
     state = big_invoice(tmp_path, pipeline, total_units=60, unit_price=300.0)
     assert state["status"] == "pending_review"
     with pytest.raises(review.ReviewError, match="limit"):
-        approve(pipeline, state["invoice_id"], "Ann", "ap_specialist")
+        approve(pipeline, state["invoice_id"], "Ann Kim", "ap_specialist")
     assert approve(pipeline, state["invoice_id"], "Dana Lee", "vp_finance")["status"] == "paid"
 
 
@@ -77,7 +77,7 @@ def test_large_invoice_needs_two_people_one_with_authority(pipeline, tmp_path):
     with pytest.raises(review.ReviewError, match="already approved"):
         approve(pipeline, iid, "dana  LEE", "cfo")  # same person, different role/casing: still the same person
     with pytest.raises(review.ReviewError, match="limit covers the amount"):
-        approve(pipeline, iid, "Raj", "vp_finance")  # second VP: nobody with authority for $60K
+        approve(pipeline, iid, "Raj Mehta", "vp_finance")  # second VP: nobody with authority for $60K
     final = approve(pipeline, iid, "Sam Patel", "cfo", "approved")
     assert final["status"] == "paid"
     # Above the bank's $50K automatic limit, but allowed because two people approved it.
@@ -99,9 +99,9 @@ def test_bank_detail_change_needs_two_approvers_including_a_senior(pipeline):
     case = review.load_case(pipeline.store, iid, pipeline.settings.policy)
     assert case.requirement.approvals == 2 and case.requirement.senior_required
 
-    assert approve(pipeline, iid, "Ann", "ap_specialist", "called vendor on file number")["status"] == "awaiting_approval"
+    assert approve(pipeline, iid, "Ann Kim", "ap_specialist", "called vendor on file number")["status"] == "awaiting_approval"
     with pytest.raises(review.ReviewError, match="senior approver"):
-        approve(pipeline, iid, "Bo", "department_approver")  # would complete the count without a senior
+        approve(pipeline, iid, "Bo Chen", "department_approver")  # would complete the count without a senior
     assert approve(pipeline, iid, "Dana Lee", "vp_finance")["status"] == "paid"
 
 
@@ -120,21 +120,21 @@ def test_would_complete_matches_the_button_label(pipeline, tmp_path):
 def test_hold_requires_a_note_and_blocks_until_approved(pipeline):
     iid = process(pipeline, DATA / "invoice_1014.xml")["invoice_id"]
     with pytest.raises(review.ReviewError, match="investigated"):
-        review.hold(pipeline.store, iid, reviewer="Dana", role="vp_finance", note=" ", settings=pipeline.settings)
-    review.hold(pipeline.store, iid, reviewer="Dana", role="vp_finance", note="Treasury checking FX route", settings=pipeline.settings)
+        review.hold(pipeline.store, iid, reviewer="Dana Lee", role="vp_finance", note=" ", settings=pipeline.settings)
+    review.hold(pipeline.store, iid, reviewer="Dana Lee", role="vp_finance", note="Treasury checking FX route", settings=pipeline.settings)
     assert pipeline.store.get_invoice(iid)["status"] == "on_hold"
-    assert approve(pipeline, iid, "Dana", "vp_finance")["status"] == "paid"
+    assert approve(pipeline, iid, "Dana Lee", "vp_finance")["status"] == "paid"
 
 
 def test_held_invoice_still_blocks_duplicates(pipeline, tmp_path):
     iid = process(pipeline, DATA / "invoice_1012.pdf")["invoice_id"]  # escalated (look-alike vendor)
-    review.hold(pipeline.store, iid, reviewer="Dana", role="vp_finance", note="verifying entity", settings=pipeline.settings)
+    review.hold(pipeline.store, iid, reviewer="Dana Lee", role="vp_finance", note="verifying entity", settings=pipeline.settings)
     assert process(pipeline, DATA / "invoice_1012.txt")["status"] == "rejected"  # same invoice again
 
 
 def test_reject_records_a_precedent(pipeline):
     iid = process(pipeline, DATA / "invoice_1012.pdf")["invoice_id"]
-    review.reject(pipeline.store, iid, reviewer="Dana", role="vp_finance", note="not our vendor", settings=pipeline.settings)
+    review.reject(pipeline.store, iid, reviewer="Dana Lee", role="vp_finance", note="not our vendor", settings=pipeline.settings)
     assert pipeline.store.get_invoice(iid)["status"] == "rejected"
     assert pipeline.store.vendor_precedents("QuickShip Distributers")[0]["decision"] == "reject"
 
@@ -145,15 +145,15 @@ def test_reject_records_a_precedent(pipeline):
 def test_reopened_rejection_needs_cfo_and_a_second_person(pipeline):
     iid = process(pipeline, DATA / "invoice_1002.txt")["invoice_id"]  # rejected: 20 GadgetX, 5 in stock
     with pytest.raises(review.ReviewError, match="justification"):
-        review.reopen(pipeline.store, iid, reviewer="Dana", role="vp_finance", reason="ok", settings=pipeline.settings)
-    review.reopen(pipeline.store, iid, reviewer="Dana", role="vp_finance",
+        review.reopen(pipeline.store, iid, reviewer="Dana Lee", role="vp_finance", reason="ok", settings=pipeline.settings)
+    review.reopen(pipeline.store, iid, reviewer="Dana Lee", role="vp_finance",
                   reason="Vendor shipped from a second warehouse; receipt confirmed", settings=pipeline.settings)
     case = review.load_case(pipeline.store, iid, pipeline.settings.policy)
     assert case.status == "pending_review" and case.is_override and case.requirement.required_role == "cfo"
 
-    assert approve(pipeline, iid, "Dana", "vp_finance")["status"] == "awaiting_approval"
+    assert approve(pipeline, iid, "Dana Lee", "vp_finance")["status"] == "awaiting_approval"
     with pytest.raises(review.ReviewError, match="CFO"):
-        approve(pipeline, iid, "Raj", "vp_finance")
+        approve(pipeline, iid, "Raj Mehta", "vp_finance")
     assert approve(pipeline, iid, "Sam Patel", "cfo")["status"] == "paid"
 
 
@@ -164,14 +164,14 @@ def test_duplicates_and_attacks_can_never_be_reopened(pipeline, path, code):
         process(pipeline, DATA / "invoice_1011.pdf")  # the original, paid
     iid = process(pipeline, path)["invoice_id"]
     with pytest.raises(review.ReviewError, match=code):
-        review.reopen(pipeline.store, iid, reviewer="Sam", role="cfo", reason="I am sure this one is fine, pay it",
+        review.reopen(pipeline.store, iid, reviewer="Sam Patel", role="cfo", reason="I am sure this one is fine, pay it",
                       settings=pipeline.settings)
 
 
 def test_approvals_before_a_reopen_do_not_count(pipeline):
     iid = process(pipeline, DATA / "invoice_1012.pdf")["invoice_id"]
-    review.reject(pipeline.store, iid, reviewer="Dana", role="vp_finance", note="unsure", settings=pipeline.settings)
-    review.reopen(pipeline.store, iid, reviewer="Dana", role="vp_finance", reason="Confirmed same legal entity via tax ID",
+    review.reject(pipeline.store, iid, reviewer="Dana Lee", role="vp_finance", note="unsure", settings=pipeline.settings)
+    review.reopen(pipeline.store, iid, reviewer="Dana Lee", role="vp_finance", reason="Confirmed same legal entity via tax ID",
                   settings=pipeline.settings)
     case = review.load_case(pipeline.store, iid, pipeline.settings.policy)
     assert case.approvers == [] and case.missing()[0].startswith("2 more")
@@ -180,7 +180,7 @@ def test_approvals_before_a_reopen_do_not_count(pipeline):
 def test_unreadable_documents_cannot_be_reopened(pipeline):
     iid = process(pipeline, ADV / "adv_05_scanned_image_only.pdf")["invoice_id"]
     with pytest.raises(review.ReviewError):
-        review.reopen(pipeline.store, iid, reviewer="Sam", role="cfo", reason="Will key it in by hand later on", settings=pipeline.settings)
+        review.reopen(pipeline.store, iid, reviewer="Sam Patel", role="cfo", reason="Will key it in by hand later on", settings=pipeline.settings)
 
 
 # ---- interfaces share the same engine ---------------------------------------------------------------------
@@ -193,7 +193,7 @@ def test_cli_enforces_the_same_rules(settings, tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("LLM_PROVIDER", "offline")
     with contextlib.redirect_stdout(io.StringIO()), InvoicePipeline(settings) as p:
         iid = p.process(ADV / "adv_02_bank_change.txt")["invoice_id"]
-    assert main.main(["--approve", str(iid), "--reviewer", "Ann", "--role", "ap_specialist", "--note", "called"]) == 0
-    assert main.main(["--approve", str(iid), "--reviewer", "Ann", "--role", "vp_finance"]) == 1  # same person
-    assert main.main(["--approve", str(iid), "--reviewer", "Dana", "--role", "vp_finance"]) == 0
+    assert main.main(["--approve", str(iid), "--reviewer", "Ann Kim", "--role", "ap_specialist", "--note", "called"]) == 0
+    assert main.main(["--approve", str(iid), "--reviewer", "Ann Kim", "--role", "vp_finance"]) == 1  # same person
+    assert main.main(["--approve", str(iid), "--reviewer", "Dana Lee", "--role", "vp_finance"]) == 0
     assert review.load_case(review.Store(settings.db_path), iid, settings.policy).status == "paid"

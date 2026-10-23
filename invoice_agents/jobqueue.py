@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import threading
 import uuid
@@ -23,8 +22,8 @@ from pathlib import Path
 from typing import Callable
 
 from .db import Store, now_iso
+from .agents.payment import settle_unconfirmed
 from .graph import InvoicePipeline
-from .models import Invoice
 
 log = logging.getLogger(__name__)
 
@@ -115,14 +114,10 @@ class JobQueue:
                 with self.store.connect() as conn:  # never reached the ledger: just run it again
                     conn.execute("UPDATE jobs SET status = 'queued', available_at = ? WHERE id = ?", (now_iso(), job["id"]))
                 continue
-            status = record["status"]
-            if status == "approved":  # crashed between approval and the bank confirming: finish the payment
-                inv = Invoice(**json.loads(record["result_json"])["invoice"])
-                payment = pipeline.backend.pay(invoice_id=record["id"], invoice_number=inv.invoice_number, vendor=inv.vendor,
-                                               amount=inv.total, currency=inv.currency)
-                status = "paid" if payment["status"] in ("success", "skipped") else "failed"
-                self.store.update_invoice_status(record["id"], status, "approve", record["reasoning"])
-            self.complete(job["id"], outcome=status, invoice_id=record["id"])
+            if record["status"] == "approved":  # crashed between approval and the bank confirming: finish it
+                settle_unconfirmed(self.store, pipeline.backend, older_than_s=0)
+                record = self.store.get_invoice(record["id"])
+            self.complete(job["id"], outcome=record["status"], invoice_id=record["id"])
         return len(stale)
 
     def stats(self) -> QueueStats:

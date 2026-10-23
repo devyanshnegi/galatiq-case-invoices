@@ -45,7 +45,8 @@ class LocalBackend:
 
     def pay(self, **kwargs) -> dict:
         return bank_pay(self.store, single_payment_limit=self.settings.bank_single_payment_limit,
-                        dual_approved_limit=self.settings.bank_dual_approved_limit, quiet=self.quiet, **kwargs)
+                        dual_approved_limit=self.settings.bank_dual_approved_limit, fx_rates=self.settings.policy.fx_rates,
+                        quiet=self.quiet, **kwargs)
 
     def close(self) -> None:
         pass

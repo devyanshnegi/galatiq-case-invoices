@@ -88,13 +88,13 @@ def test_ap_server_runs_the_whole_workflow(settings):
             folder = await call("process_folder", folder=str(DATA), workers=4)
             pending = await call("list_pending")
             fx = next(p for p in pending if p["currency"] == "EUR")
-            resolved = await call("resolve_invoice", invoice_id=fx["invoice_id"], approve=True, reviewer="VP", note="FX ok")
-            again = await call("resolve_invoice", invoice_id=fx["invoice_id"], approve=True, reviewer="VP")
+            resolved = await call("resolve_invoice", invoice_id=fx["invoice_id"], approve=True, note="FX ok")
+            again = await call("resolve_invoice", invoice_id=fx["invoice_id"], approve=True)
             summary = await call("ledger_summary")
             return folder, pending, resolved, again, summary
 
     with contextlib.redirect_stdout(io.StringIO()), InvoicePipeline(settings, quiet_payments=True) as pipeline:
-        folder, pending, resolved, again, summary = asyncio.run(scenario(ap.build_server(pipeline, allowed_root=DATA.parent.parent)))
+        folder, pending, resolved, again, summary = asyncio.run(scenario(ap.build_server(pipeline, allowed_root=DATA.parent.parent, reviewer="Dana Lee")))
     assert folder["queued"] == 20 and Counter(folder["outcomes"]) == Counter(EXPECTED.values())
     assert len(pending) == 3 and resolved["payment"]["status"] == "success"
     assert "error" in again  # can't approve twice

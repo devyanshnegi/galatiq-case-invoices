@@ -123,9 +123,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     name, role = review_cli.default_identity()
     who = argparse.ArgumentParser(add_help=False)
-    w = who.add_argument_group("reviewer (default from AP_REVIEWER=\"Name:role\")")
+    w = who.add_argument_group("reviewer (default from AP_REVIEWER=\"Name\")")
     w.add_argument("--as", "--reviewer", dest="reviewer", default=name, metavar="NAME", help=f"your name (default: {name})")
-    w.add_argument("--role", default=role, choices=list(review.ROLES), help=f"your role, sets your approval limit (default: {role})")
+    w.add_argument("--role", default=role, choices=list(review.ROLES),
+                   help="your role (default: from the approver roster in config/ap_policy.yaml)")
 
     writes = argparse.ArgumentParser(add_help=False)
     writes.add_argument("--dry-run", action="store_true", help="work on a throwaway copy of the ledger; nothing is written or paid")
@@ -173,10 +174,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--deep", action="store_true", help="also call the model and start the MCP servers")
     p = sub.add_parser("reset", help="clear the ledger (invoices, payments, reviews, jobs); inventory is kept")
     p.add_argument("--yes", "-y", action="store_true")
+    p = sub.add_parser("reconcile", parents=[engine], help="settle payments a crash left unconfirmed; list unknown outcomes")
+    p.add_argument("--older-than", type=float, default=300, metavar="SECONDS", help="only rows untouched this long (default 300)")
     return parser
 
 
 # ---- commands ----------------------------------------------------------------------------------------------
+
+
+def _role(args, settings: Settings) -> str:
+    """Explicit --role, else the roster's role for this name, else VP Finance (no roster configured)."""
+    return getattr(args, "role", None) or review.roster_role(settings.policy, getattr(args, "reviewer", "")) or "vp_finance"
 
 
 def _settings(args) -> Settings:
@@ -186,7 +194,10 @@ def _settings(args) -> Settings:
 
 
 def _confirm_reset(store: Store, args) -> bool:
-    if not getattr(args, "yes", False) and sys.stdin.isatty():
+    if not getattr(args, "yes", False):
+        if not sys.stdin.isatty():  # never wipe the ledger silently from a script or pipe
+            console.print("[red]Refusing to clear the ledger without confirmation - add --yes.[/]")
+            return False
         if not Confirm.ask(f"Clear {len(store.list_invoices())} processed invoice(s), payments and reviews?", default=False):
             return False
     store.reset_ledger()
@@ -283,12 +294,16 @@ def cmd_review_action(args, settings: Settings) -> int:
     store.init()
     with InvoicePipeline(settings, store=store, quiet_payments=getattr(args, "dry_run", False)) as pipeline:
         if args.command == "review":
-            done = review_cli.interactive(store, settings, pipeline.backend, args.reviewer, args.role, rejected=args.rejected)
+            problem = review.identity_problem(settings.policy, args.reviewer, _role(args, settings))
+            if problem:
+                console.print(f"[red]{problem}[/] - use --as NAME (or set AP_REVIEWER).")
+                return 1
+            done = review_cli.interactive(store, settings, pipeline.backend, args.reviewer, _role(args, settings), rejected=args.rejected)
             return 0 if done is not None else 1
         if getattr(args, "dry_run", False):
             console.print("[bold black on yellow] DRY RUN [/] on a copy of the ledger - nothing is recorded or paid")
         with contextlib.redirect_stdout(io.StringIO()) if args.dry_run else contextlib.nullcontext():
-            return review_cli.act(args.command, store, settings, pipeline.backend, args.invoice_id, args.reviewer, args.role, args.note)
+            return review_cli.act(args.command, store, settings, pipeline.backend, args.invoice_id, args.reviewer, _role(args, settings), args.note)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -313,6 +328,19 @@ def main(argv: list[str] | None = None) -> int:
         store = Store(settings.db_path)
         store.init()
         return 0 if _confirm_reset(store, args) else 1
+    if args.command == "reconcile":
+        from invoice_agents.agents.payment import settle_unconfirmed
+
+        store = Store(settings.db_path)
+        store.init()
+        with InvoicePipeline(settings, store=store) as pipeline, contextlib.redirect_stdout(io.StringIO()):
+            report = settle_unconfirmed(store, pipeline.backend, older_than_s=args.older_than)
+        if not report:
+            console.print("[green]Nothing to reconcile.[/]")
+        for r in report:
+            colour = "green" if r["outcome"] in ("paid", "already paid - marked paid") else "red"
+            console.print(f"  [{colour}]{r['outcome']}[/] · {r['invoice_number']} (ID {r['invoice_id']})")
+        return 1 if any(r["outcome"] == "needs bank reconciliation" for r in report) else 0
     if args.command in ("pending", "show", "payments"):
         store = Store(settings.db_path)
         store.init()
@@ -322,7 +350,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "payments":
             review_cli.payments(store, args.csv)
             return 0
-        return review_cli.show(store, settings, args.invoice_id, args.reviewer, args.role, as_json=args.json)
+        return review_cli.show(store, settings, args.invoice_id, args.reviewer, _role(args, settings), as_json=args.json)
 
     dry = getattr(args, "dry_run", False)
     with dry_run_settings(settings) if dry else contextlib.nullcontext(settings) as active:

@@ -4,207 +4,88 @@
   "revision": null,
   "supersedes_invoice_number": null,
   "invoice_date": "2026-10-20",
-  "tax_point_date": "2026-10-18",
   "due_date": "2026-11-19",
   "currency": "USD",
-  "language": "en-US",
-  "page_count": 1,
-  "e_invoice_id": "US-EI-2026-0003001",
 
   "vendor": {
     "name": "Widgets Inc.",
-    "trading_name": "Widgets",
-    "former_names": [],
     "vendor_id": "V-000117",
     "tax_id": "36-4815162",
-    "vat_id": null,
-    "company_registration_number": "IL-5521873",
-    "duns_number": "080012345",
     "address": "100 Main St, Chicago, IL 60601",
-    "address_structured": {
-      "line1": "100 Main St",
-      "line2": null,
-      "city": "Chicago",
-      "region": "IL",
-      "postal_code": "60601",
-      "country": "US"
-    },
     "remit_to": {
       "name": "Widgets Inc. - Accounts Receivable",
       "address": "100 Main St, Chicago, IL 60601"
-    },
-    "contact": {
-      "name": "Priya Raman",
-      "email": "ar@widgets-inc.example",
-      "phone": "+1-312-555-0142"
-    },
-    "website": "https://widgets-inc.example"
+    }
   },
 
   "buyer": {
-    "name": "Acme Corp",
-    "customer_account_number": "ACME-00042",
-    "tax_id": "74-1029384",
-    "billing_address": "1 Acme Way, Austin, TX 78701",
-    "ship_to": {
-      "name": "Acme Corp - Manufacturing Division",
-      "address": "2200 Industrial Blvd, Dock B, Austin, TX 78744",
-      "attention": "Receiving"
-    },
-    "department": "Manufacturing",
-    "cost_center": "CC-4100",
-    "requester": "Jim Ortega",
-    "approver_of_record": null
+    "name": "Acme Corp"
   },
 
   "references": {
     "purchase_order_number": "PO-20261001",
-    "contract_number": "MSA-2025-018",
-    "quote_number": "Q-88213",
-    "sales_order_number": "SO-55120",
-    "goods_receipt_number": "GRN-77310",
-    "delivery_note_number": "DN-40921",
-    "packing_slip_number": "PS-40921",
-    "bill_of_lading": "BOL-993120",
-    "tracking_numbers": ["1Z999AA10123456784"],
-    "project_code": "PRJ-LINE-3-UPGRADE"
-  },
-
-  "delivery": {
-    "ship_from": "Widgets Inc. Warehouse, 4500 W 47th St, Chicago, IL 60632",
-    "ship_date": "2026-10-16",
-    "delivery_date": "2026-10-18",
-    "shipping_method": "Ground freight",
-    "carrier": "UPS Freight",
-    "incoterms": "FOB Shipping Point"
+    "goods_receipt_number": "GRN-77310"
   },
 
   "line_items": [
     {
-      "line_number": 1,
       "po_line_number": 1,
       "item": "WidgetA",
       "vendor_part_number": "WI-WA-100",
-      "buyer_part_number": "WidgetA",
       "description": "Standard widget, type A",
       "quantity": 10,
       "unit_of_measure": "EA",
       "unit_price": 250.00,
-      "discount_percent": 0,
       "discount_amount": 0.00,
-      "tax_code": "TX-STD",
-      "tax_rate": 0.0825,
-      "tax_amount": 206.25,
       "amount": 2500.00,
-      "gl_account": "5100-RAW-MATERIALS",
-      "cost_center": "CC-4100",
-      "delivery_date": "2026-10-18",
-      "lot_numbers": ["LOT-2026-0912"],
-      "serial_numbers": [],
-      "country_of_origin": "US",
-      "hs_code": "8487.90",
       "note": null
     },
     {
-      "line_number": 2,
       "po_line_number": 2,
       "item": "WidgetB",
       "vendor_part_number": "WI-WB-200",
-      "buyer_part_number": "WidgetB",
       "description": "Standard widget, type B",
       "quantity": 4,
       "unit_of_measure": "EA",
       "unit_price": 500.00,
-      "discount_percent": 0.05,
       "discount_amount": 100.00,
-      "tax_code": "TX-STD",
-      "tax_rate": 0.0825,
-      "tax_amount": 156.75,
       "amount": 1900.00,
-      "gl_account": "5100-RAW-MATERIALS",
-      "cost_center": "CC-4100",
-      "delivery_date": "2026-10-18",
-      "lot_numbers": ["LOT-2026-0930"],
-      "serial_numbers": [],
-      "country_of_origin": "US",
-      "hs_code": "8487.90",
-      "note": "5% volume discount per MSA-2025-018"
+      "note": "5% volume discount agreed on the PO"
     },
     {
-      "line_number": 3,
       "po_line_number": 3,
       "item": "GadgetX",
       "vendor_part_number": "WI-GX-750",
-      "buyer_part_number": "GadgetX",
       "description": "Precision gadget, model X",
       "quantity": 2,
       "unit_of_measure": "EA",
       "unit_price": 750.00,
-      "discount_percent": 0,
       "discount_amount": 0.00,
-      "tax_code": "TX-STD",
-      "tax_rate": 0.0825,
-      "tax_amount": 123.75,
       "amount": 1500.00,
-      "gl_account": "5100-RAW-MATERIALS",
-      "cost_center": "CC-4100",
-      "delivery_date": "2026-10-18",
-      "lot_numbers": [],
-      "serial_numbers": ["GX-26-00481", "GX-26-00482"],
-      "country_of_origin": "US",
-      "hs_code": "9031.80",
       "note": null
     }
   ],
 
-  "charges": [
-    {"type": "freight", "description": "Ground freight, Chicago to Austin", "amount": 150.00, "taxable": false}
-  ],
-  "invoice_discounts": [],
-
-  "tax_summary": [
-    {"jurisdiction": "TX", "tax_code": "TX-STD", "taxable_amount": 5900.00, "rate": 0.0825, "amount": 486.75}
-  ],
-  "tax_exempt": false,
-  "tax_exemption_certificate": null,
-  "reverse_charge": false,
-  "withholding_tax": 0.00,
-
   "subtotal": 5900.00,
-  "total_discount": 100.00,
   "shipping": 150.00,
-  "total_charges": 150.00,
   "tax_rate": 0.0825,
   "tax_amount": 486.75,
   "total": 6536.75,
   "amount_paid": 0.00,
-  "credits_applied": 0.00,
   "balance_due": 6536.75,
-  "amount_in_words": "Six thousand five hundred thirty-six dollars and seventy-five cents",
-  "fx_rate_to_usd": null,
 
   "payment_terms": "2/10 Net 30",
   "payment": {
-    "terms_code": "2/10 NET 30",
-    "net_days": 30,
     "early_payment_discount_percent": 0.02,
     "early_payment_discount_days": 10,
-    "early_payment_discount_deadline": "2026-10-30",
-    "late_fee": "1.5% per month on overdue balance",
     "accepted_methods": ["ACH", "check"],
-    "payment_reference": "INV-3001 / ACME-00042",
     "bank": {
       "bank_name": "First Lakeshore Bank",
       "account_holder": "Widgets Inc.",
       "account_number_last4": "6789",
-      "routing_number": "071000013",
-      "iban": null,
-      "swift_bic": null
+      "routing_number": "071000013"
     }
   },
 
-  "notes": "Delivered complete against PO-20261001. Questions: ar@widgets-inc.example.",
-  "terms_and_conditions": "Governed by MSA-2025-018.",
-  "authorized_by": "Priya Raman, AR Manager",
-  "attachments": ["packing_slip_PS-40921.pdf", "proof_of_delivery_DN-40921.pdf"]
+  "notes": "Delivered complete against PO-20261001."
 }

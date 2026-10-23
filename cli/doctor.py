@@ -63,7 +63,7 @@ def check_policy(settings: Settings) -> list[Check]:
     problems = policy_problems(settings)
     detail = f"{p.policy_id} v{p.version} from {settings.policy_file.name}"
     if problems:
-        return [Check(FAIL, "Policy", f"{detail}: {len(problems)} problem(s) - {problems[0]}", "python main.py policy  (lists them all)")]
+        return [Check(FAIL, "Policy", f"{detail}: {len(problems)} problem(s) - " + "; ".join(problems), "fix config/ap_policy.yaml")]
     return [Check(OK if p.reviewers else WARN, "Policy", f"{detail}; {len(p.always_escalate)} always-escalate rules{roster}",
                   "" if p.reviewers else "add human_review.reviewers to config/ap_policy.yaml")]
 
@@ -95,7 +95,7 @@ def check_database(settings: Settings) -> list[Check]:
         if stuck or unknown:
             out.append(Check(FAIL if unknown else WARN, "Unsettled payments",
                              f"{stuck} approved but unpaid after a crash, {unknown} with an unknown bank outcome",
-                             "python main.py reconcile"))
+                             "run python main.py batch: it finishes interrupted payments; check unknown outcomes with the bank"))
         else:
             out.append(Check(OK, "Unsettled payments", "none"))
     except Exception as exc:
@@ -109,7 +109,7 @@ def check_samples() -> list[Check]:
     return [Check(OK if n else WARN, "Sample invoices", f"{n} files in data/invoices", "" if n else "restore data/invoices from the repo")]
 
 
-def check_llm(settings: Settings, deep: bool, label: str = "LLM", llm_settings=None) -> list[Check]:
+def check_llm(settings: Settings, label: str = "LLM", llm_settings=None, roundtrip: bool = True) -> list[Check]:
     s = llm_settings or settings.llm
     from invoice_agents.llm import DEFAULT_MODELS
 
@@ -134,7 +134,7 @@ def check_llm(settings: Settings, deep: bool, label: str = "LLM", llm_settings=N
             return [Check(FAIL, label, f"{s.provider} selected but {env} is not set - agents will fall back to offline rules",
                           f"add {env}=... to .env")]
         out = [Check(OK, label, f"{s.provider}, model {model}, API key set")]
-    if deep:
+    if roundtrip:  # one real call: the only way to know a provider actually works (xAI, Anthropic and OpenAI are untested)
         out.append(_llm_roundtrip(s, label))
     return out
 
@@ -158,9 +158,9 @@ def _llm_roundtrip(s, label: str) -> Check:
         return Check(FAIL, f"{label} round-trip", f"{type(exc).__name__}: {str(exc)[:120]}", "check the model name and that it supports JSON output")
 
 
-def check_mcp(settings: Settings, deep: bool) -> list[Check]:
-    if settings.tools_backend != "mcp" and not deep:
-        return [Check(SKIP, "MCP servers", "tools run in-process (TOOLS_BACKEND=local)", "add --deep to test the MCP servers anyway")]
+def check_mcp(settings: Settings) -> list[Check]:
+    if settings.tools_backend != "mcp":
+        return [Check(SKIP, "MCP servers", "tools run in-process (TOOLS_BACKEND=local)", "set TOOLS_BACKEND=mcp to use and test them")]
     from invoice_agents.backends import MCPBackend
 
     try:
@@ -173,11 +173,11 @@ def check_mcp(settings: Settings, deep: bool) -> list[Check]:
         return [Check(FAIL, "MCP servers", f"could not start: {str(exc)[:120]}", "pip install -r requirements.txt; run from the project folder")]
 
 
-def run(settings: Settings, deep: bool = False) -> int:
-    checks = [*check_python(), *check_policy(settings), *check_database(settings), *check_samples(), *check_llm(settings, deep)]
+def run(settings: Settings) -> int:
+    checks = [*check_python(), *check_policy(settings), *check_database(settings), *check_samples(), *check_llm(settings)]
     if settings.secondary_llm:
-        checks += check_llm(settings, deep, "Second-opinion LLM", settings.secondary_llm)
-    checks += check_mcp(settings, deep)
+        checks += check_llm(settings, "Second-opinion LLM", settings.secondary_llm)
+    checks += check_mcp(settings)
 
     table = Table("", "Check", "Result", "Fix", header_style="bold", box=None, title="Acme AP doctor", title_justify="left")
     for c in checks:
@@ -188,6 +188,6 @@ def run(settings: Settings, deep: bool = False) -> int:
     if fails:
         console.print(f"[red]{fails} problem(s)[/] to fix" + (f", {warns} warning(s)" if warns else "") + ".")
     else:
-        console.print("[green]All good.[/]" + (f" {warns} warning(s)." if warns else "") + ("" if deep else " [dim](--deep also calls the model and starts the MCP servers)[/]"))
+        console.print("[green]All good.[/]" + (f" {warns} warning(s)." if warns else ""))
     return 1 if fails else 0
 

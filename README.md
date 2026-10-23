@@ -1,259 +1,308 @@
-# Acme AP Agents
+# Galatiq Case: Invoice Processing Automation
 
-**A multi-agent system that takes Acme Corp's invoices from "file in an inbox" to "paid, rejected, or on a person's desk", with a written reason for every decision and a guarantee that no AI mistake can pay a bad invoice.**
-
-- **On the 20 provided invoices:** 6 paid automatically, 11 blocked (**$217K of bad invoices stopped**), 3 sent to a human with a specific question.
-- **At volume:** 1,000 synthetic invoices with known correct answers: **100% correct decisions, 0 wrongly paid, 0 double payments**, including duplicates racing through parallel workers.
-- **With a real model** (local qwen2.5:7b): the same 11 blocks, and the model never caused a bad payment, even when it made mistakes.
+A working multi-agent prototype that automates Acme Corp's invoice processing end to end: ingestion, validation, approval and payment.
 
 ```bash
 python main.py --invoice_path=data/invoices/invoice_1001.txt
 ```
 
----
+## Background
 
-## Run it in two minutes (no API key needed)
+Acme Corp loses about $2M a year on manual invoice processing: a 30% error rate, 5-day delays, and approvals spread across email chains. This system replaces the manual steps with agents. Every invoice is extracted, checked against the inventory database, approved or rejected under a written policy, and paid through the mock banking API. Each decision comes with a written reason.
+
+**Results on the 20 provided invoices** (offline rules; with a local model, INV-1010 goes to a human instead of being paid):
+- 6 paid automatically
+- 11 rejected, which blocks $217K of incorrect or fraudulent invoices
+- 3 sent to a human with a specific question
+
+## Setup
 
 ```bash
 python -m venv .venv
-.venv\Scripts\activate                 # macOS/Linux: source .venv/bin/activate
+.venv\Scripts\activate          # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-
-python main.py doctor                  # checks the setup and says how to fix anything
-python main.py batch                   # all 20 sample invoices, with a summary table
-streamlit run app.py                   # the dashboard
-pytest                                 # 211 tests
 ```
 
-Without a model, the agents use deterministic rules, so everything runs out of the box. To use an LLM, set `LLM_PROVIDER` in `.env`:
-- `ollama`: local; run `ollama pull qwen2.5:7b` first
-- `xai`: Grok, with `XAI_API_KEY`
-- `anthropic` or `openai`, with their API keys
+No API key is needed to try it. Without a model, the agents fall back to rule-based logic. To use an LLM, copy `.env.example` to `.env` and set `LLM_PROVIDER` (see [LLM integration](#llm-integration)).
 
-Swapping models is a config change, not a code change.
+Check that everything is set up:
 
----
+```bash
+python main.py doctor
+```
 
-## How this maps to the evaluation criteria
+## Running the system
 
-| Criterion | Where to look | In one line |
-|---|---|---|
-| **Functionality** | [§1](#1-functionality) | All four stages work end to end on every sample, from the CLI command in the brief. |
-| **Code quality** | [§2](#2-code-quality) | Typed contracts, pure testable checks, 211 tests, a full audit trail, graceful degradation. |
-| **Agentic sophistication** | [§3](#3-agentic-sophistication) | LangGraph with two self-correction loops (extraction retry, reviewer ↔ critic reflection) and a tool-calling reviewer. A code guardrail sits over every model decision. |
-| **Shipping mindset** | [§4](#4-shipping-mindset) | Decisions made under ambiguity, explicit scope cuts, and every claim measured. |
-| **Presentation** | [§5](#5-presentation-what-it-means-for-acme) | Each of Acme's pain points mapped to what changes and how we know. |
-| **Above and beyond** | [§6](#6-above-and-beyond) | MCP servers, volume processing, the two-person rule, policy as config, a security review, attack defenses. |
-| **UI/UX** | [§7](#7-uiux) | A dashboard built around the reviewer, plus an interactive terminal review mode. |
+The command from the brief:
 
----
+```bash
+python main.py --invoice_path=data/invoices/invoice_1001.txt
+```
 
-## 1. Functionality
+It prints a structured log of every agent step, the extracted invoice, the validation findings, and the final decision with its reasoning.
 
-**The four stages from the brief, all working:**
+The main commands:
 
-| Stage | What happens |
-|---|---|
-| **Ingestion** | PDF, TXT, email-style text, JSON, CSV and XML become one typed `Invoice`. Structured files are parsed exactly; free text goes to the LLM with a strict JSON schema. OCR noise (`2O26`, `$3,500.O0`), typos (`Vndr`, `INVOCE`) and missing fields are handled. |
-| **Validation** | Checked against the SQLite inventory: unknown items, zero-stock items, quantity over stock (**added up across lines**), and catalog price. Also: arithmetic, dates and terms, the vendor master, currency, duplicates and revisions, and fraud signals. |
-| **Approval** | Rules decide which outcomes are *allowed*. Invoices of $10K or more get VP-level scrutiny. An AI reviewer reasons within those bounds, and an AI critic challenges it. |
-| **Payment** | Approved invoices call the brief's `mock_payment` (exactly once). Rejections are logged with reasons; escalations wait for a person. |
+```bash
+python main.py batch                              # process every invoice in data/invoices, with a summary table
+python main.py review --as "Dana Lee"             # review escalated invoices one by one: approve, reject or hold
+python main.py pending                            # list invoices waiting for a person
+python main.py show INV-1006                      # everything about one invoice
+python main.py approve INV-1014 --as "Dana Lee" --note "FX rate confirmed"
+python main.py payments                           # every payment and who authorised it
+python main.py reset                              # clear the ledger and start over
+python main.py batch --dry-run                    # what would happen, without writing or paying anything
+python main.py doctor                             # check the setup
+streamlit run app.py                              # the dashboard
+pytest                                            # the tests
+```
 
-**What happened to each provided invoice**, including traps the brief's table doesn't mention:
+Reviewers are the people on the approver roster in `config/ap_policy.yaml` (Dana Lee, Raj Mehta, Sam Patel, Ann Kim, Bo Chen); each person's role and approval limit comes from the roster. **These names are placeholders** (see [Placeholders](#placeholders)).
 
-| Outcome | Invoices | Why |
-|---|---|---|
-| ✅ **Paid** | 1001, 1004, 1006, 1011, 1015 | Clean. |
-| ✅ **Paid with a condition** | 1010 | Its +20% price is documented on the invoice as a rush order. |
-| ⛔ **Rejected** | 1002, 1005, 1007 | Quantity over stock (20 GadgetX vs 5; 8 GadgetX; 20 WidgetA and 15 WidgetB). 1007's total is also $110 off. |
-| ⛔ **Rejected** | 1013 (JSON and PDF) | Fine line by line, but WidgetA adds up to 22 units across 3 lines vs 15 in stock, and the total is $50 off. |
-| ⛔ **Rejected** | 1003 | "FakeItem" with zero stock, a due date of "yesterday", an unknown vendor, and "URGENT… wire transfer" pressure. |
-| ⛔ **Rejected** | 1008, 1016 | Items not in inventory (SuperGizmo, MegaSprocket, WidgetC). |
-| ⛔ **Rejected** | 1009 | Negative quantity, no vendor, no due date, and totals that don't add up. |
-| ⛔ **Rejected** | 1011.txt, 1012.txt | The same invoice arrived twice (PDF + TXT): duplicates. |
-| 🙋 **To a human** | 1004_revised | Revision of an invoice already paid. If approved, **only the difference** is paid. |
-| 🙋 **To a human** | 1012.pdf | "QuickShip Distribut**e**rs", a look-alike of an approved vendor. |
-| 🙋 **To a human** | 1014 | Billed in EUR; treasury confirms the rate. |
+**Every command and option, the `.env` settings, and the other tools are in [docs/CLI.md](docs/CLI.md).**
 
-**The brief's technical requirements:**
+## Workflow
 
-| Requirement | How it's met |
-|---|---|
-| Grok as reasoning engine, others acceptable | An xAI adapter (`LLM_PROVIDER=xai`, default `grok-3`). Developed and measured on local qwen2.5:7b because no Grok key was available, as the brief allows. Claude, OpenAI and offline modes are also supported. |
-| Multi-agent orchestration framework | **LangGraph**: 10 nodes, conditional routing, and two loops in the graph, plus the reviewer's own tool-calling loop ([§3](#3-agentic-sophistication)). |
-| Tool use, structured outputs, self-correction | All three, each with tests that use a scripted model ([§3](#3-agentic-sophistication)). |
-| No internet: simulate everything locally | SQLite inventory and ledger, mock bank, local model, fixed FX reference rates. |
-| Python; `python main.py --invoice_path=...` | Exactly that command works, alongside a fuller CLI. |
-| Structured logs and results | A live step-by-step trace, a JSON audit log (`logs/runs.jsonl`), an `audit_log` table, and `--json` output. |
-| Mock inventory DB with the given seed data | Created automatically with exactly that seed, extended with catalog prices, a vendor master and the ledger. |
-
-## 2. Code quality
-
-- **Clear separation of concerns.** These are all separate modules:
-  - the agents (`invoice_agents/agents/`)
-  - pure validation checks (`checks.py`)
-  - the approval policy (`policy.py`)
-  - the human-review engine (`review.py`)
-  - the LLM layer (`llm/`)
-  - storage (`db.py`)
-  - the interfaces (`cli/`, `ui/`, `mcp_servers/`)
-
-  The dashboard, the CLI and the MCP server all call the **same** review engine, so the rules can't differ between them.
-- **Typed contracts.** Pydantic models (`Invoice`, `ValidationReport`, `ApprovalDecision`, `Critique`…) are the only thing passed between agents, and they double as the LLM's output schemas.
-- **Testable by design.** Checks are pure functions. The LLM is behind an interface, so tests use a **scripted fake model** to make agentic loops deterministic.
-- **211 tests**, including:
-  - every sample invoice end to end
-  - every agent loop
-  - concurrency races
-  - crash recovery
-  - MCP over the real protocol
-  - attack scenarios
-  - a 150-invoice load test
-  - one regression test per security finding (`tests/test_loopholes.py`)
-- **Error handling:**
-  - unreadable files fail cleanly with a ledger entry
-  - an unreachable model falls back to rules, and the trace says so
-  - transient failures are retried with backoff
-  - unknown payment outcomes are never assumed
-- **Observability:**
-  - every agent step writes a timed trace event
-  - every human action is in the audit log
-  - `python main.py doctor` checks the setup
-  - the dashboard's Operations tab shows where the time goes
-
-## 3. Agentic sophistication
+The four stages are separate agents connected in a LangGraph workflow.
 
 ```mermaid
 flowchart LR
-    load[Load document] -->|JSON / CSV / XML| qa
-    load -->|TXT / PDF / email| extract[LLM extract]
-    load -->|unreadable| failed
-    extract --> qa[Self-check vs source]
-    qa -->|problems, retries left| extract
-    qa --> validate[Rule checks<br/>+ LLM risk analyst]
-    validate -->|only one outcome allowed| fast[Fast path]
-    validate -->|needs judgement| review[VP reviewer<br/>with tool calls]
-    review --> critic[Audit critic]
-    critic -->|disagrees| review
-    critic -->|agrees / max rounds| guard[Policy guardrail]
-    fast --> guard
-    guard --> pay[Pay / log rejection / human queue]
+    L[Load file] -->|TXT / PDF| X[Extract with LLM]
+    L -->|JSON / CSV / XML| S[Self-check vs document]
+    L -->|unreadable| FAIL[Logged as failed]
+    X --> S
+    S -->|problems, attempts left| X
+    S --> V[Validation]
+    V -->|only one outcome allowed| P[Fast-path decision]
+    V -->|needs judgement| R[VP reviewer]
+    R --> C[Critic]
+    C -->|disagrees, rounds left| R
+    C --> G[Policy guardrail]
+    P --> G
+    G --> PAY[Payment / rejection log / human review]
 ```
 
-**The agents:**
+### 1. Ingestion
 
-| Agent | What the LLM does | What code guarantees |
+Extracts vendor, amount, line items with quantities, due date and other fields from PDF, TXT, JSON, CSV and XML files.
+
+- **Structured files** (JSON, CSV, XML) are parsed directly, with no LLM needed.
+- **Unstructured text and PDFs** go to the LLM, which returns JSON matching a strict schema.
+- **A self-check** compares the LLM's extraction with the original document. Every item, quantity, the total and the currency must actually appear in it, and the vendor must not be Acme itself.
+  - If something doesn't match, the LLM tries again with the specific problems listed, for up to 3 attempts in total.
+  - An optional second model can then get one more try.
+  - If the extraction still can't be verified, the invoice goes to a human instead of being paid or rejected.
+- **Messy input** is handled: typos (`Vndr`, `INVOCE`), OCR errors (`2O26`, `$3,500.O0`), spacing variations (`Widget A`), missing fields, and dates like "yesterday".
+- **Unreadable files** (for example a scanned PDF with no text) are logged as failed, so nothing silently disappears.
+
+### 2. Validation
+
+Checks each invoice against the SQLite database and a set of rules. The examples are from the provided invoices, except where noted.
+
+| Check | Example |
+|---|---|
+| Quantity exceeds stock | INV-1002: 20× GadgetX, only 5 in stock |
+| Quantities split across lines | INV-1013: WidgetA appears on 3 lines totalling 22, only 15 in stock |
+| Zero-stock or fake item | INV-1003: FakeItem |
+| Item not in inventory | INV-1008: SuperGizmo, MegaSprocket; INV-1016: WidgetC |
+| Invalid data | INV-1009: negative quantity, missing vendor, missing due date |
+| Arithmetic | INV-1007 and INV-1013: subtotal + tax doesn't equal the total |
+| Price vs catalog | INV-1010: +20% on one line (documented as a rush order) |
+| Duplicates and revisions | INV-1011 and INV-1012 arrive twice; INV-1004 is revised after being paid |
+| Vendor checks | INV-1012: "QuickShip Distribut**e**rs" closely resembles an approved vendor |
+| Currency | INV-1014: billed in EUR |
+| Fraud signals | INV-1003: "URGENT… wire transfer". Prompt injection, bank-detail changes and invoices split to stay under the approval limit are tested with the extra cases in `data/adversarial/`. |
+
+When an LLM is configured, a **risk analyst** also reviews the invoice for things rules can't express, such as an implausible address or pressure tactics. It is skipped when a rule has already blocked the invoice, since the outcome can't change.
+
+### 3. Approval
+
+Rules decide which outcomes are allowed, and the AI reasons within those limits:
+
+| Situation | Allowed outcome |
+|---|---|
+| Any blocking error (stock, unknown item, bad maths, missing or invalid due date, duplicate, prompt injection) | Reject |
+| Foreign currency, revision of a paid invoice, unknown or look-alike vendor, changed bank details or remit address, invoices split to dodge the limit, unusual tax or freight, no invoice number, an extraction that couldn't be verified | Human review (or reject) |
+| $50,000 or more | Human review (or reject) |
+| $10,000 or more, with any warning | Human review (or reject) |
+| $10,000 or more, clean | Approve after VP-level review |
+| Under $10,000, with warnings | Reviewer's judgement: approve only if the invoice documents the reason (e.g. a rush order) |
+| Under $10,000, clean | Approve |
+
+When only one outcome is allowed (a clean invoice, or one with a blocking error), the decision is made directly by the **fast path**, with no AI deliberation needed.
+
+Otherwise:
+1. A **VP reviewer agent** investigates using tool calls and writes a decision. Its tools look up inventory, the vendor master, vendor history, prior invoices with the same number, earlier human decisions for the vendor, and the approval policy.
+2. A **critic agent** reviews that decision. If it disagrees, the reviewer revises, for up to 3 rounds in total.
+3. If they still disagree, the invoice goes to a human. The exception is a rejection, which always stands.
+
+A **code guardrail** checks every final decision against the policy, so a model can never approve an invoice the policy doesn't allow.
+
+### 4. Payment
+
+- **Approved:** the brief's `mock_payment(vendor, amount)` is called exactly once per invoice; the bank refuses a second payment. Payments above the bank's limit are declined and go back to human review. A revision of an invoice that was already paid pays only the difference.
+- **Rejected:** the rejection is logged with its reasoning.
+- **Escalated:** the invoice waits for a person, who can approve, reject or put it on hold, from the dashboard or the CLI.
+
+Some invoices need **two different people** to approve:
+- $50,000 or more
+- a changed bank or remit address
+- a reopened rejection (one of the two must be the CFO)
+
+## Technical requirements
+
+| Requirement | Implementation |
+|---|---|
+| Grok as the reasoning engine (other models acceptable) | Supported through the xAI API (`LLM_PROVIDER=xai`, model `grok-3`). Switching is a one-line change in `.env`. **Only the local model (qwen2.5:7b via Ollama) has been tested**, since no Grok key was available. The Grok, Claude and OpenAI adapters are implemented but have not been run against their real APIs. |
+| Multi-agent orchestration | LangGraph |
+| Function calling / tool use | The VP reviewer calls tools to look up inventory, vendors, history and policy |
+| Structured outputs | Every LLM response must match a Pydantic schema; invalid output is sent back to be fixed |
+| Self-correction loops | Extraction self-check and retry; reviewer ↔ critic reflection loop |
+| No internet | Local SQLite database, mock bank, local model, fixed currency rates |
+| Python, run locally | Python 3.12, CLI and Streamlit dashboard, no cloud |
+| Structured logs and results | Step-by-step console output, JSON lines in `logs/runs.jsonl`, and an audit log table |
+
+## Mock inventory database
+
+Created automatically on first run (`inventory.db`) with the brief's seed data:
+
+| Item | Stock |
+|---|---|
+| WidgetA | 15 |
+| WidgetB | 10 |
+| GadgetX | 5 |
+| FakeItem | 0 |
+
+The database is extended with:
+- **catalog unit prices**, for the price check
+- **a vendor master** (approved vendors, aliases, addresses)
+- **tables for the ledger, payments, approvals and audit log**
+
+Rebuild it at any time with `python -m invoice_agents.db --reset`.
+
+## LLM integration
+
+All agents use one interface (`invoice_agents/llm/`), so the model can be swapped in `.env` without changing code:
+
+| `LLM_PROVIDER` | Notes | Tested? |
 |---|---|---|
-| **Ingestion** | Reads messy text into structured JSON | Self-check: every extracted item, quantity, total and the currency must appear in the document. Otherwise the model retries with the specific problems listed; an optional second model gets one try; then it goes to a human. |
-| **Risk analyst** | Spots what rules miss (a landmark as a remit address, pressure tactics) | Signals need a category, quoted evidence and a severity; restated rule findings are dropped. |
-| **VP reviewer** | Investigates with **tool calls** (policy, inventory, vendor master, vendor history, prior invoices, human precedents) and writes a decision | It can only choose outcomes the policy allows. |
-| **Audit critic** | Challenges the decision; the reviewer revises (up to 3 rounds) | Code fact-checks the reasoning too. Unresolved disagreement goes to a human. |
-| **Policy guardrail** | — | Overrides any outcome the policy doesn't allow. A test runs a model that insists on paying a blocked invoice, and it's still rejected. |
+| `ollama` (default) | Local and free. Run `ollama pull qwen2.5:7b` first. | Yes, with qwen2.5:7b |
+| `xai` | Grok. Set `XAI_API_KEY`. | **No** |
+| `anthropic` | Claude. Set `ANTHROPIC_API_KEY`. | **No** |
+| `openai` | Set `OPENAI_API_KEY`. | **No** |
+| `offline` | No model; rule-based agents. | Yes (used by the test suite) |
 
-**The core design choice: LLMs for language, code for facts.** A model reads the invoice; a model never decides whether 22 > 15. That's why a small local model is good enough: its mistakes can only make the system *slower*, never cause a wrong payment.
+**Only Ollama (qwen2.5:7b) and offline mode have been tested.** No API keys were available for the hosted providers, so the xAI, Anthropic and OpenAI adapters have never been called against the real APIs. They follow each provider's documented API, and the unit tests only check that they are built and configured correctly. Check one with `python main.py doctor --provider xai` (it makes one real call) before relying on it.
 
-**What running a real model taught us.** qwen2.5:7b called "past due" a blocking error and rejected a clean invoice. It flagged harmless details as fraud, and sometimes missed vendors on the first read. Each became a fix with a test: fact-checked critiques, typed risk signals, info notes kept out of prompts, and deterministic clean-up. Details are in [docs/DETAILS.md](docs/DETAILS.md).
+If the configured model isn't reachable, the system falls back to rule-based logic and says so in the log.
 
-## 4. Shipping mindset
+**Results with a real model (qwen2.5:7b on a laptop GPU):** the same 11 rejections as the rules, 5 paid, and 4 sent to a human. The model made mistakes during development, such as treating "past due" as a blocking error. The guardrails and critic caught every one, and no invoice was wrongly paid.
 
-**Decisions made under ambiguity:**
+## Results on the provided invoices
 
-| Ambiguity | Decision | Why |
+These are the outcomes with the offline rules (`LLM_PROVIDER=offline`), which give the same result on every run.
+
+| Invoice | Outcome | Reason |
 |---|---|---|
-| No Grok key | A provider-agnostic LLM layer, built and measured on a local model | Grok works with one config line; invoices never leave the building; nothing to pay to evaluate it. |
-| "Flag mismatches", but what then? | Three outcomes: pay, reject, or escalate with a stated reason | A delayed payment costs a phone call; a fraudulent one costs the money. |
-| Reflection loop vs. small-model reliability | The loop is bounded, and code enforces the policy | Deliberation is spent only where judgement matters (the "fast path" skips it when only one outcome is allowed): **3.9 model calls per invoice instead of about 8**. |
-| Stock: consume it on payment? | A static "on record" quantity | Results don't depend on processing order; documented. |
+| 1001, 1004, 1006, 1011, 1015 | Paid | Clean |
+| 1010 | Paid | Price premium documented as a rush order. **With qwen2.5:7b it goes to a human instead**: the policy leaves a documented premium under $10,000 to the reviewer's judgement, and the model chooses to ask a person. |
+| 1002 | Rejected | 20 GadgetX requested, 5 in stock |
+| 1003 | Rejected | FakeItem (zero stock), due date "yesterday", unknown vendor, urgency/wire-transfer pressure |
+| 1005 | Rejected | 8 GadgetX requested, 5 in stock |
+| 1007 | Rejected | Over stock, and the total is $110 off |
+| 1008 | Rejected | Items not in inventory |
+| 1009 | Rejected | Negative quantity, missing vendor and due date, totals don't add up |
+| 1011.txt, 1012.txt | Rejected | Duplicates (same invoice already received as a PDF) |
+| 1013 (JSON and PDF) | Rejected | WidgetA totals 22 across 3 lines vs 15 in stock, and the total is $50 off |
+| 1016 | Rejected | WidgetC not in inventory |
+| 1004_revised | Human review | Revision of an invoice already paid (only the difference would be paid) |
+| 1012.pdf | Human review | Vendor name closely resembles an approved vendor |
+| 1014 | Human review | Billed in EUR |
 
-**Explicit scope cuts**, all listed in [Limitations](#limitations):
-- no OCR for scanned PDFs (they fail cleanly)
-- no live FX rates
-- no login (an approver roster stands in for SSO)
-- a single-host queue
+## Evaluation criteria
 
-**Measured, not claimed.** `python -m invoice_agents.loadtest` generates invoices with known answers and scores every decision:
+**Functionality.** All four stages run end to end from the brief's command, on every provided file format. All 20 sample invoices reach the correct outcome.
 
-| Run | Throughput | Correct | Wrongly paid |
-|---|---|---|---|
-| Rules only, 1 worker | ~10,000 invoices/min | 100% | 0 |
-| Tools over MCP, 4 workers | ~6,000/min | 100% | 0 |
-| qwen2.5:7b on a laptop GPU | ~5/min (p50 ≈ 5–19s per invoice) | 100% | 0 |
+**Code quality.**
+- **Structure:** the agents, validation checks, approval policy, LLM layer and storage are separate modules.
+- **Typed data:** Pydantic models are passed between agents.
+- **Tests:** 212, covering every sample invoice, every agent loop (using a scripted fake model), concurrency and failure cases.
+- **Error handling:** unreadable files are logged, failed model calls fall back to rules, and payments can't happen twice.
 
-The honest finding: on one laptop GPU the model is the bottleneck, so the biggest lever is calling it less. More workers help only with a hosted model like Grok.
+**Agentic sophistication.**
+- **Four agents plus a risk analyst and a critic**, connected in LangGraph.
+- **Tool use** by the VP reviewer.
+- **Structured outputs** on every LLM call.
+- **Two self-correction loops:** extraction retry, and the reviewer–critic reflection.
+- **A policy guardrail** over every AI decision.
 
-## 5. Presentation: what it means for Acme
+**Shipping mindset.**
+- **No Grok key:** the LLM layer was made swappable and the system was built and tested on a free local model; the hosted providers are untested.
+- **Model calls only where needed:** the AI deliberates only when the outcome actually needs judgement, which halves the calls per invoice.
+- **Documented scope cuts:** see [Limitations](#limitations).
 
-| Acme's pain today | What changes | Evidence |
-|---|---|---|
-| **30% error rate** from manual keying | Extracted fields are verified against the document. Arithmetic, stock, prices and duplicates are checked in code on every invoice. | 100% decision accuracy on 1,000 test invoices; all of the brief's traps caught, plus extras like totals that don't add up and quantities split across lines. |
-| **5-day delays** | Clean invoices are paid in seconds. People only see exceptions, each with the specific question to answer. | 17 of the 20 samples needed no human: 6 paid, 11 rejected with reasons. |
-| **Approvals in email chains** | One review queue with approval limits by role, a two-person rule for large or risky payments, and a full audit trail of who decided what and why. | Every approval, hold, rejection and reopen is recorded and shown on the invoice. |
-| **Fraud and errors caught by luck** | Fake items, look-alike vendors, changed remit or bank details, urgency pressure, invoices split to dodge approval, duplicates, silent revisions and prompt injection are all caught. | Attack samples in `data/adversarial/`, each with a test. |
-| **$2M/year lost to manual processing** | Straight-through processing for clean invoices; human time goes only to invoices that need judgement. | The Operations tab tracks straight-through rate, LLM calls and time per step. |
+**Presentation.**
+- **Errors:** the 30% error rate is addressed by checking every extracted value against the document and the database.
+- **Delays:** clean invoices are paid in seconds instead of days.
+- **Approvals:** email chains become one review queue with a full audit trail.
+- **Fraud:** checks run on every invoice, instead of relying on someone noticing.
 
-The written policy behind every decision is [docs/AP_POLICY.md](docs/AP_POLICY.md): roles, approval matrix, vendor checks, payments, fraud, AI governance, and a 25-case playbook. The values the agents enforce live in [config/ap_policy.yaml](config/ap_policy.yaml), so finance can change thresholds without touching code.
+**Above and beyond.**
+- **Human review:** approve, reject and hold, with approval limits by role and a two-person rule for large payments. Rejected invoices can be reopened with a justification.
+- **A written AP policy** ([docs/AP_POLICY.md](docs/AP_POLICY.md)), with its values in [config/ap_policy.yaml](config/ap_policy.yaml) so thresholds can be changed without code.
+- **Volume processing:** parallel workers, a job queue with retries and crash recovery, and a 1,000-invoice load test. It scored 100% correct decisions and 0 wrongly paid.
+- **MCP servers** for the ERP, the bank, and the whole AP system, so it can be used from Claude Desktop.
+- **Defenses against prompt injection** in invoices, bank-detail changes, look-alike vendors and invoices split to avoid approval limits ([data/adversarial/](data/adversarial/)).
+- **A security review** that closed 19 loopholes, each with a test.
+- **A complete invoice template** and field guide ([docs/INVOICE_FIELDS.md](docs/INVOICE_FIELDS.md)).
 
-## 6. Above and beyond
+**UI/UX.**
+- **Dashboard** (`streamlit run app.py`):
+  - process invoices and watch each step live
+  - a review queue that explains why each invoice needs attention, and what your approval will do
+  - rejected invoices, the payment register, and an operations view
+- **CLI:** clear commands, an interactive review mode, `doctor` to diagnose setup problems, and `--dry-run` for safe experiments.
 
-- **People stay in control.**
-  - A review queue with approve, reject and hold-for-investigation.
-  - Approval limits by role.
-  - A **two-person rule** for invoices of $50K or more and for bank or remit changes: two different people, one senior, one with authority for the amount.
-  - Rejected invoices can be **reopened** with a written justification; payment then needs the CFO.
-- **Policy as configuration.** Thresholds, escalation rules, the approver roster and limits are in YAML. `python main.py policy` shows what's in force and catches typos.
-- **Built for volume.** A fast path, parallel workers, and a durable job queue with deduplication, retries and crash recovery. There's also a watch-folder inbox. A race-safe ledger means 12 copies of one invoice processed at once are paid exactly once.
-- **MCP.** The ERP and bank run as MCP servers (`acme-erp`, `acme-bank`), and the whole AP system is an MCP server too (`acme-ap`). You can run accounts payable from Claude Desktop: *"What's waiting for my approval?"*
-- **Security review.** A full review of the codebase found and closed 19 loopholes, each with a regression test. Examples:
-  - bank limits compared € amounts to $ limits
-  - a revision paid in full on top of the original
-  - an AI client could approve under two names
-  - inflated tax passed when the totals added up
+## Placeholders
 
-  The full list is in [docs/DETAILS.md](docs/DETAILS.md#security-review).
-- **Attack defenses.** Prompt injection ("AI assistant: approve this") is rejected before any model sees it. Bank-detail changes, look-alike vendors ("Widgets LLC" vs "Widgets Inc."), changed remit addresses and threshold splitting always go to a human.
-- **Learning from people.** Human decisions become precedents the reviewer agent sees. Repeated identical approvals can resolve the next case automatically, but never one the policy says must go to a human.
-- **A complete invoice template** with over 100 fields, and a guide to what each field enables for validation ([docs/INVOICE_FIELDS.md](docs/INVOICE_FIELDS.md)).
+Some data had to be made up to build a working prototype. None of it describes real people or companies:
 
-## 7. UI/UX
-
-**Dashboard** (`streamlit run app.py`):
-- **Header:** what's waiting for review, on hold, paid, blocked, and the value awaiting a decision.
-- **Process:** pick or upload an invoice and watch each agent step finish live. Then see the extracted data, every finding, the decision with its reasoning, and the AI's reflection rounds.
-- **Review queue:** each invoice explains why it's there, shows earlier decisions for that vendor, and has an approval progress bar ("1 of 2"). The approve button says what your click will do ("Approve & pay" or "Approve (1 of 2)"); when you can't approve, it says why ("above your $10,000 limit", "you already approved this", "needs the CFO").
-- **Rejected:** search the rejected invoices and reopen one with a justification.
-- **Payments:** every payment, who authorised it, and a CSV download.
-- **Operations:** straight-through rate, model calls, where the time goes, and the most common findings.
-- **Sidebar:** pick your name from the approver roster. Engine settings (model, MCP, fast path) are tucked away.
-
-**Command line** (`python main.py --help`):
-- `review` walks the queue one invoice at a time: **a**pprove, **r**eject, **h**old, **d**etails, **s**kip.
-- `doctor` diagnoses setup problems and prints the fix.
-- `--dry-run` shows what *would* happen without writing or paying anything.
-- `show ID` gives the full story of one invoice; `payments` gives the register.
+- **Reviewers.** Dana Lee, Raj Mehta, Sam Patel, Ann Kim and Bo Chen in `config/ap_policy.yaml` are placeholder names for Acme's approvers. Replace them with the real roster (in production, from SSO or the HR system).
+- **Approval policy values.** The thresholds, limits and rules in `config/ap_policy.yaml` and [docs/AP_POLICY.md](docs/AP_POLICY.md) are a template for Acme to confirm. The $10,000 VP threshold comes from the brief; values in [brackets] in the policy document are suggestions.
+- **Exchange rates.** The fixed EUR, GBP and CAD rates in the policy file are placeholders, not live rates.
+- **Vendor master.** The approved-vendor list and addresses in `invoice_agents/db.py` are taken from the sample invoices, plus a few invented vendors.
+- **Invoice template.** The vendor ID, tax ID and bank details in `data/templates/invoice_template.json` are fictional.
+- **Bank.** Payments go to the brief's `mock_payment`; no money moves.
 
 ## Limitations
 
-- **No login.** The approver roster limits who may act and in which role, but it can't stop someone choosing another person's name. Production needs SSO.
-- **No OCR.** Scanned image-only PDFs fail cleanly and are logged for manual entry.
-- **Fixed FX reference rates** (no internet). Foreign-currency invoices always go to a human.
-- **Single-host queue** (SQLite and threads). Multi-host needs a real broker; the claim, retry and recover logic carries over.
-- **Bank details** are checked by keyword ("our bank details have changed"), not yet against details on file.
+- **No login.** Reviewers pick their name from a roster in the policy file; production would use SSO.
+- **No OCR.** Scanned image-only PDFs are logged as unreadable.
+- **Fixed currency rates** (no internet). Foreign-currency invoices always go to a human.
+- **Stock is not reduced** when an invoice is paid.
+- **The job queue runs on a single machine.**
 
-**Next steps:**
-- email ingestion into the watch folder
-- OCR
-- purchase-order and goods-receipt three-way matching
-- real ERP and bank MCP servers
-- SSO
-
-## Repository map
+## Project structure
 
 ```
-main.py, cli/          command line (process, batch, queue, review, doctor, dry run...)
-app.py, ui/            Streamlit dashboard
-invoice_agents/        agents, LangGraph workflow, checks, policy, review engine, LLM layer, storage, MCP servers
-config/ap_policy.yaml  the policy values the agents enforce
-data/                  sample invoices, attack samples, invoice template
-docs/                  AP_POLICY.md · INVOICE_FIELDS.md · DETAILS.md (technical deep-dive) · CASE.md (the brief)
-tests/                 211 tests
+main.py                 CLI entry point
+app.py                  Streamlit dashboard
+invoice_agents/
+  agents/               ingestion, validation, approval, payment
+  graph.py              LangGraph workflow
+  checks.py             validation rules
+  policy.py             approval rules
+  review.py             human review (approvals, two-person rule)
+  llm/                  LLM providers (Ollama, xAI, Anthropic, OpenAI)
+  db.py                 SQLite database
+  bank.py               mock payment API
+  mcp_servers/          MCP servers
+cli/, ui/               CLI commands and dashboard tabs
+config/ap_policy.yaml   approval policy settings
+data/invoices/          provided sample invoices
+data/adversarial/       attack test cases
+docs/                   CLI reference, AP policy, invoice field guide, technical details, original brief
+tests/                  212 tests
 ```
+
+More technical detail, including what a real model got wrong, the volume benchmarks, MCP integration and the security review, is in [docs/DETAILS.md](docs/DETAILS.md).

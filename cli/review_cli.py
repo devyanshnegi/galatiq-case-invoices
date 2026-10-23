@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import csv
 import io
 import json
 import os
@@ -93,14 +92,13 @@ def case_details(case: review.ReviewCase) -> None:
 # ---- interactive ------------------------------------------------------------------------------------
 
 
-def interactive(store: Store, settings: Settings, backend, reviewer: str, role: str, *, rejected: bool = False,
-                ask: Ask = Prompt.ask) -> Counter:
-    """Walk the queue (or the rejected list) one invoice at a time. Returns a count of actions taken."""
-    statuses = ("rejected",) if rejected else review.REVIEWABLE
+def interactive(store: Store, settings: Settings, backend, reviewer: str, role: str, *, ask: Ask = Prompt.ask) -> Counter:
+    """Walk the review queue one invoice at a time. Returns a count of actions taken."""
+    statuses = review.REVIEWABLE
     ids = [c.invoice_id for c in review.list_cases(store, settings.policy, statuses=statuses)]
     done: Counter = Counter()
     if not ids:
-        console.print("[green]Nothing to review.[/]" if not rejected else "[green]No rejected invoices.[/]")
+        console.print("[green]Nothing to review.[/]")
         return done
     console.print(f"Reviewing as [bold]{reviewer}[/] ({review.ROLES[role]}). {len(ids)} invoice(s). "
                   "[dim]Change identity with --as NAME or AP_REVIEWER=\"Name\".[/]")
@@ -111,9 +109,14 @@ def interactive(store: Store, settings: Settings, backend, reviewer: str, role: 
             if case.status not in statuses:  # changed by someone else meanwhile
                 break
             console.print(case_panel(case, store, settings, reviewer, role, position=f"[{n}/{len(ids)}]"))
-            choices = _choices(case, settings, reviewer, role, rejected)
+            choices = _choices(case, settings, reviewer, role)
             console.print("  " + "   ".join(f"[bold cyan]{k}[/] {label}" for k, label in choices.items()))
-            key = ask("Action", choices=list(choices), default="s", show_choices=False).strip().lower()
+            try:
+                key = ask("Action", choices=list(choices), default="s", show_choices=False).strip().lower()
+            except (EOFError, KeyboardInterrupt):  # input ended (Ctrl+C, Ctrl+Z, or no terminal): stop cleanly
+                console.print("\n[dim]Review ended.[/]")
+                _summary(done)
+                return done
             if key == "d":
                 case_details(case)
                 continue
@@ -123,7 +126,12 @@ def interactive(store: Store, settings: Settings, backend, reviewer: str, role: 
             if key == "s":
                 done["skipped"] += 1
                 break
-            outcome = _do(key, case, store, settings, backend, reviewer, role, ask)
+            try:
+                outcome = _do(key, case, store, settings, backend, reviewer, role, ask)
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[dim]Review ended - that action was not recorded.[/]")
+                _summary(done)
+                return done
             if outcome is None:  # cancelled (empty reason)
                 continue
             done[outcome["status"]] += 1
@@ -134,12 +142,7 @@ def interactive(store: Store, settings: Settings, backend, reviewer: str, role: 
     return done
 
 
-def _choices(case, settings, reviewer, role, rejected) -> dict[str, str]:
-    if rejected:
-        out = {}
-        if review.why_cannot_reopen(case, settings.policy) is None:
-            out["o"] = "reopen (policy exception)"
-        return out | {"d": "details", "s": "skip", "q": "quit"}
+def _choices(case, settings, reviewer, role) -> dict[str, str]:
     out = {}
     if review.why_cannot_approve(case, reviewer, role, settings.policy) is None:
         complete = review.would_complete(case, role)
@@ -157,15 +160,13 @@ def _do(key, case, store, settings, backend, reviewer, role, ask) -> dict | None
             note = ask("Note (optional)", default="")
             with contextlib.redirect_stdout(io.StringIO()):  # the mock bank prints; the outcome line reports it
                 return review.approve(note=note, backend=backend, **who)
-        prompt = {"r": "Reason for rejecting", "h": "What needs investigating", "o": "Why is this invoice actually correct"}[key]
+        prompt = {"r": "Reason for rejecting", "h": "What needs investigating"}[key]
         text = ask(f"{prompt} (empty to cancel)", default="").strip()
         if not text:
             return None
         if key == "r":
             return review.reject(note=text, **who)
-        if key == "h":
-            return review.hold(note=text, **who)
-        return review.reopen(reason=text, **who)
+        return review.hold(note=text, **who)
     except review.ReviewError as exc:
         console.print(f"  [red]Not allowed:[/] {exc}")
         return None
@@ -179,18 +180,58 @@ def _summary(done: Counter) -> None:
 # ---- single actions and views ------------------------------------------------------------------------
 
 
-def act(action: str, store: Store, settings: Settings, backend, invoice_id: int, reviewer: str, role: str, note: str) -> int:
+def resolve_ref(store: Store, ref: str, prefer: tuple[str, ...] = ()) -> int:
+    """Turn what a person typed into a ledger ID. Accepts the ledger ID shown by `pending` (e.g. 18)
+    or the invoice number (INV-1006, 'inv 1006', 1006). Raises LookupError with a helpful message."""
+    from invoice_agents.normalize import normalize_invoice_number
+
+    ref = str(ref).strip()
+    number = normalize_invoice_number(ref)
+    rows = store.find_prior_invoices(number, None) if number else []
+    if ref.isdigit():
+        by_id = store.get_invoice(int(ref))
+        # A bare number could be a ledger ID or an invoice number: never guess when it's both.
+        if by_id and rows and by_id["invoice_number"] != number:
+            ids = ", ".join(str(r["id"]) for r in rows)
+            raise LookupError(f"'{ref}' is both ledger ID {ref} ({by_id['invoice_number']}) and invoice {number} (ID {ids}). "
+                              f"Type {number} for the invoice, or the ID of the one you mean.")
+        if by_id:
+            return int(ref)
+    if not rows:
+        raise LookupError(f"No invoice with ledger ID or invoice number '{ref}'. "
+                          "See `python main.py pending` for IDs, or process invoices first with `python main.py batch`.")
+    candidates = [r for r in rows if r["status"] in prefer] or rows if prefer else rows
+    if len(candidates) == 1:
+        return candidates[0]["id"]
+    if not prefer:
+        # Just looking: show the most relevant entry (in review > paid > rejected/failed), unless that's a tie.
+        rank = {"pending_review": 0, "on_hold": 0, "approved": 1, "paid": 1, "rejected": 2, "failed": 3}
+        best = min(rank.get(r["status"], 4) for r in candidates)
+        top = [r for r in candidates if rank.get(r["status"], 4) == best]
+        if len(top) == 1:
+            others = ", ".join(f"ID {r['id']} ({r['status'].replace('_', ' ')})" for r in candidates if r is not top[0])
+            console.print(f"[dim]{number} has other ledger entries too: {others}. Use the ID to see one of those.[/]")
+            return top[0]["id"]
+    options = "; ".join(f"ID {r['id']} ({r['status'].replace('_', ' ')}, {Path(r['source_file'] or '?').name})" for r in candidates)
+    raise LookupError(f"{number} matches more than one ledger entry: {options}. Use the ID.")
+
+
+PREFER_FOR = {"approve": review.REVIEWABLE, "reject": review.REVIEWABLE}
+
+
+def act(action: str, store: Store, settings: Settings, backend, invoice_ref, reviewer: str, role: str, note: str) -> int:
+    try:
+        invoice_id = resolve_ref(store, invoice_ref, PREFER_FOR.get(action, ()))
+    except LookupError as exc:
+        console.print(f"[red]{exc}[/]")
+        return 1
     who = dict(store=store, invoice_id=invoice_id, reviewer=reviewer, role=role, settings=settings)
     try:
         if action == "approve":
             with contextlib.redirect_stdout(io.StringIO()):
                 outcome = review.approve(note=note, backend=backend, **who)
-        elif action == "reject":
-            outcome = review.reject(note=note, **who)
-        elif action == "hold":
-            outcome = review.hold(note=note, **who)
         else:
-            outcome = review.reopen(reason=note, **who)
+            outcome = review.reject(note=note, **who)
     except review.ReviewError as exc:
         console.print(f"[red]Not allowed:[/] {exc}")
         return 1
@@ -211,21 +252,18 @@ def pending(store: Store, settings: Settings) -> None:
                       _progress(len(c.approvers), c.requirement.approvals), "; ".join(c.missing()) or "-", (r["reasoning"] or "")[:90])
     console.print(table)
     console.print("Review interactively with [bold]python main.py review[/], or act directly: "
-                  "[bold]approve | reject | hold | reopen ID --note \"...\"[/]")
+                  "[bold]approve | reject INVOICE --note \"...\"[/]")
 
 
-def show(store: Store, settings: Settings, invoice_id: int, reviewer: str, role: str, as_json: bool = False) -> int:
+def show(store: Store, settings: Settings, invoice_ref, reviewer: str, role: str) -> int:
     try:
+        invoice_id = resolve_ref(store, invoice_ref)
         case = review.load_case(store, invoice_id, settings.policy)
-    except review.ReviewError as exc:
+    except (LookupError, review.ReviewError) as exc:
         console.print(f"[red]{exc}[/]")
         return 1
     trace = store.audit_for_run(case.row["run_id"])
     payment = store.payment_for_invoice(invoice_id)
-    if as_json:
-        console.print_json(json.dumps({"invoice": case.row | {"result_json": case.result}, "approvals": case.history,
-                                       "payment": payment, "trace": trace}, default=str))
-        return 0
     console.print(case_panel(case, store, settings, reviewer, role))
     case_details(case)
     if payment:
@@ -241,65 +279,17 @@ def show(store: Store, settings: Settings, invoice_id: int, reviewer: str, role:
     return 0
 
 
-def payments(store: Store, csv_path: Path | None = None) -> None:
+def payments(store: Store) -> None:
     rows = [p for p in store.list_payments() if p["status"] == "success"]
     approvers: dict[int, list[str]] = {}
     for a in reversed(store.all_approvals()):
         if a["action"] == "approve":
             approvers.setdefault(a["invoice_id"], []).append(f"{a['reviewer']} ({review.ROLES.get(a['role'], a['role'])})")
     table = Table("Paid at", "Reference", "Invoice", "Vendor", "Amount", "Authorised by", title="Payment register", header_style="bold")
-    out = []
     for p in rows:
         who = " + ".join(approvers.get(p["invoice_id"], [])) or "agents (auto-approved)"
         table.add_row(p["paid_at"][:16].replace("T", " "), p["reference"], p["invoice_number"] or "-", p["vendor"] or "-",
                       money(p["amount"], p["currency"]), who)
-        out.append({**{k: p[k] for k in ("paid_at", "reference", "invoice_number", "vendor", "amount", "currency")}, "authorised_by": who})
     console.print(table)
     usd = sum(p["amount"] or 0 for p in rows if (p["currency"] or "USD") == "USD")
     console.print(f"{len(rows)} payment(s), {money(usd)} in USD · {sum(1 for p in rows if p['invoice_id'] in approvers)} human-approved")
-    if csv_path:
-        with open(csv_path, "w", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=["paid_at", "reference", "invoice_number", "vendor", "amount", "currency", "authorised_by"])
-            writer.writeheader()
-            writer.writerows(out)
-        console.print(f"Wrote {csv_path}")
-
-
-ENV_OVERRIDES = {"VP_REVIEW_THRESHOLD": "approval.vp_review_threshold", "CFO_THRESHOLD": "approval.cfo_threshold",
-                 "PRICE_VARIANCE_TOLERANCE": "matching.price_variance_tolerance", "BANK_SINGLE_PAYMENT_LIMIT": "payments.single_payment_limit",
-                 "FAST_PATH": "automation.fast_path"}
-
-
-def policy_show(settings: Settings) -> int:
-    from invoice_agents.policy import policy_problems
-
-    p = settings.policy
-    overridden = {key for env, key in ENV_OVERRIDES.items() if os.getenv(env)}
-    table = Table("Setting", "Value", "Source", title=f"Policy {p.policy_id} v{p.version} · {settings.policy_file or 'built-in defaults'}",
-                  header_style="bold", title_justify="left")
-
-    def row(key: str, value) -> None:
-        table.add_row(key, str(value), "[yellow].env override[/]" if key in overridden else "policy file" if settings.policy_file else "default")
-
-    row("approval.vp_review_threshold", money(p.vp_review_threshold))
-    row("approval.cfo_threshold", money(p.cfo_threshold))
-    row("approval.approver_limits", ", ".join(f"{review.ROLES.get(r, r)} {'unlimited' if v is None else money(v)}" for r, v in p.approver_limits.items()))
-    row("human_review.two_person_approval_at", money(p.two_person_threshold))
-    row("human_review.two_person_for_codes", ", ".join(p.two_person_codes))
-    row("human_review.override", f"{p.override_approvals} approvers incl. {review.ROLES.get(p.override_required_role, p.override_required_role)}; "
-                                 f"never: {', '.join(p.not_overridable)}")
-    row("matching.price_variance_tolerance", f"{p.price_variance_tolerance:.0%}")
-    row("anti_splitting", f"{p.split_window_days} days, invoices >= {p.split_min_share:.0%} of VP threshold")
-    row("currency", f"base {p.base_currency}; " + ", ".join(f"{c} {r}" for c, r in p.fx_rates.items()))
-    row("payments.single_payment_limit", money(settings.bank_single_payment_limit))
-    row("payments.dual_approved_payment_limit", money(settings.bank_dual_approved_limit))
-    row("automation.fast_path", settings.fast_path)
-    row("automation.precedent_min_approvals", p.precedent_min_approvals)
-    console.print(table)
-    console.print("[bold]Always escalate:[/] " + ", ".join(p.always_escalate))
-    problems = policy_problems(settings)
-    for problem in problems:
-        console.print(f"[red]✗[/] {problem}")
-    if not problems:
-        console.print("[green]✓ policy is consistent[/]")
-    return 1 if problems else 0

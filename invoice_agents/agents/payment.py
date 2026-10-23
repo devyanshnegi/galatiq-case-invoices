@@ -41,7 +41,7 @@ def apply_payment_outcome(store: Store, invoice_id: int, payment: dict, decision
     elif payment["status"] == "declined":
         status, decision, text = "pending_review", "escalate", f"{reasoning} - bank declined: {payment.get('reason')}"
     elif payment["status"] == "unknown":
-        status, text = "failed", f"{reasoning} - PAYMENT OUTCOME UNKNOWN: {payment.get('reason')}. Run `python main.py reconcile`."
+        status, text = "failed", f"{reasoning} - PAYMENT OUTCOME UNKNOWN: {payment.get('reason')}. Check with the bank before retrying; `python main.py doctor` lists these."
     else:
         status, text = "failed", f"{reasoning} - payment failed: {payment}"
     store.update_invoice_status(invoice_id, status, decision, text)

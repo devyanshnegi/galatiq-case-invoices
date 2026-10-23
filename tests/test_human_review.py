@@ -193,7 +193,7 @@ def test_cli_enforces_the_same_rules(settings, tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("LLM_PROVIDER", "offline")
     with contextlib.redirect_stdout(io.StringIO()), InvoicePipeline(settings) as p:
         iid = p.process(ADV / "adv_02_bank_change.txt")["invoice_id"]
-    assert main.main(["--approve", str(iid), "--reviewer", "Ann Kim", "--role", "ap_specialist", "--note", "called"]) == 0
-    assert main.main(["--approve", str(iid), "--reviewer", "Ann Kim", "--role", "vp_finance"]) == 1  # same person
-    assert main.main(["--approve", str(iid), "--reviewer", "Dana Lee", "--role", "vp_finance"]) == 0
+    assert main.main(["approve", str(iid), "--as", "Ann Kim", "--note", "called"]) == 0   # role comes from the roster
+    assert main.main(["approve", str(iid), "--as", "Ann Kim"]) == 1                       # same person again
+    assert main.main(["approve", str(iid), "--as", "Dana Lee"]) == 0
     assert review.load_case(review.Store(settings.db_path), iid, settings.policy).status == "paid"

@@ -18,12 +18,10 @@ def test_template_is_internally_consistent():
     lines = data["line_items"]
     for li in lines:
         assert round(li["quantity"] * li["unit_price"] - li["discount_amount"], 2) == li["amount"]
-        assert round(li["amount"] * li["tax_rate"], 2) == li["tax_amount"]
     assert round(sum(li["amount"] for li in lines), 2) == data["subtotal"]
-    assert round(sum(li["discount_amount"] for li in lines), 2) == data["total_discount"]
-    assert round(sum(t["amount"] for t in data["tax_summary"]), 2) == data["tax_amount"]
-    assert round(data["subtotal"] + data["tax_amount"] + data["total_charges"], 2) == data["total"]
-    assert round(data["total"] - data["amount_paid"] - data["credits_applied"], 2) == data["balance_due"]
+    assert round(data["subtotal"] * data["tax_rate"], 2) == data["tax_amount"]
+    assert round(data["subtotal"] + data["tax_amount"] + data["shipping"], 2) == data["total"]
+    assert round(data["total"] - data["amount_paid"], 2) == data["balance_due"]
 
 
 def test_template_parses_with_discounts():

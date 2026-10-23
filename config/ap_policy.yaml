@@ -15,7 +15,7 @@ policy:
 
 currency:
   base: USD                                   # [enforced] §11
-  reference_rates_to_usd:                     # [enforced] §11 treasury reference rates; others are rejected
+  reference_rates_to_usd:                     # [enforced] §11 treasury reference rates; others are rejected. PLACEHOLDER rates, not live
     USD: 1.0
     EUR: 1.08
     GBP: 1.27
@@ -39,6 +39,7 @@ human_review:                                 # §4.3, §15 [enforced]
   # Who may act as a reviewer, and in which role. When this list is non-empty, a name not on it can't
   # approve, reject, hold or reopen, and nobody can pick a role other than their own.
   # (The prototype has no login; in production this comes from SSO / the HR system.)
+  # PLACEHOLDER names - replace with Acme's real approvers.
   reviewers:
     - {name: Dana Lee, role: vp_finance}
     - {name: Raj Mehta, role: vp_finance}

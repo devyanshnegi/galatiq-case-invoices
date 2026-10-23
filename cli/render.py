@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from rich.console import Console
@@ -60,7 +59,7 @@ def step_line(node: str, update: dict) -> str:
     return f"  [green]✓[/] {NODE_LABELS.get(node, node):<38} [dim]{ms:>5} ms[/]  {detail}"
 
 
-def render_result(state: dict, verbose: bool) -> None:
+def render_result(state: dict) -> None:
     inv = state.get("invoice") or {}
     if state.get("status") == "failed":
         console.print(Panel(state.get("error") or "unknown error", title="FAILED", border_style="magenta"))
@@ -78,7 +77,7 @@ def render_result(state: dict, verbose: bool) -> None:
     console.print(items)
 
     issues = (state.get("validation") or {}).get("issues", [])
-    shown = [i for i in issues if verbose or i["severity"] != "info"]
+    shown = [i for i in issues if i["severity"] != "info"]
     if shown:
         table = Table("", "Check", "Finding", box=None, header_style="bold dim")
         for i in shown:
@@ -105,10 +104,8 @@ def run_one(pipeline: InvoicePipeline, path: Path, args) -> dict:
     for node, update, state in pipeline.stream(path):
         if not args.quiet:
             console.print(step_line(node, update))
-    if args.json:
-        console.print_json(json.dumps({k: v for k, v in state.items() if k != "raw_text"}, default=str))
-    elif not args.quiet:
-        render_result(state, args.verbose)
+    if not args.quiet:
+        render_result(state)
     return state
 
 

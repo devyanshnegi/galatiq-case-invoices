@@ -166,25 +166,3 @@ class JobQueue:
             for t in threads:
                 t.join()
             raise
-
-    def watch(self, directory: Path, pipeline: InvoicePipeline, workers: int, *, interval_s: float = 2.0,
-              stop: threading.Event | None = None, on_done: Callable[[dict, dict], None] | None = None,
-              on_enqueue: Callable[[int], None] | None = None) -> None:
-        """Watch a folder (e.g. where an email gateway drops attachments) and process new files as they land."""
-        stop = stop or threading.Event()
-        directory.mkdir(parents=True, exist_ok=True)
-
-        def scan() -> None:
-            while not stop.is_set():
-                added, _ = self.enqueue_dir(directory)
-                if added and on_enqueue:
-                    on_enqueue(added)
-                stop.wait(interval_s)
-
-        scanner = threading.Thread(target=scan, name="watcher", daemon=True)
-        scanner.start()
-        try:
-            self.run_workers(pipeline, workers, stop=stop, until_empty=False, on_done=on_done)
-        finally:
-            stop.set()
-            scanner.join(interval_s + 1)

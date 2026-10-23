@@ -42,7 +42,7 @@ Values in [brackets] are template choices for Acme to confirm.
 
 **SoD rule:** no single person may create a vendor, approve that vendor's invoice, *and* release its payment. — *Manual*
 
-**Approver roster.** Only people listed in `human_review.reviewers` (config/ap_policy.yaml) may approve, reject, hold or reopen, and only in their listed role. Nobody can pick their own authority. — *Agents*. The prototype has no login: the roster stands in for SSO, so a person choosing someone else's name is not prevented. In production, identity must come from SSO.
+**Approver roster.** Only people listed in `human_review.reviewers` (config/ap_policy.yaml) may approve, reject, hold or reopen, and only in their listed role. Nobody can pick their own authority. — *Agents*. The names in the prototype's roster are placeholders. The prototype has no login: the roster stands in for SSO, so a person choosing someone else's name is not prevented. In production, identity must come from SSO.
 
 ## 3. What a valid invoice must contain
 
@@ -64,7 +64,7 @@ These should be present; missing them weakens checks and may trigger a hold:
 - remit-to address
 - the vendor's tax ID
 
-*Agents (partial)*. The full field list is in [INVOICE_FIELDS.md](INVOICE_FIELDS.md).
+*Agents (partial)*. The field list is in [INVOICE_FIELDS.md](INVOICE_FIELDS.md).
 
 **Arithmetic must reconcile exactly** (tolerance [$0.01]): quantity × unit price − line discount = line amount; the line amounts add up to the subtotal; subtotal + tax + charges = total. Any mismatch is rejected. *Agents.* Tax must equal rate × taxable amount within [$0.05], or the invoice is held. — *Agents*
 
@@ -199,7 +199,7 @@ Whatever the amount, these are **never** paid automatically. — *Agents*. The l
 | Rule | Value | Enforcement |
 |---|---|---|
 | **Single-payment limit** at the bank | [$50,000] for automated payments. [$250,000] when two people approved (§4.3). **Limits are in USD**: foreign-currency payments are converted at the treasury rate first. Larger amounts are declined and go back to human review. | **Agents (bank-side)** |
-| **Unconfirmed payments** | If a payment's outcome is unknown (a crash, a timeout, an unclear bank answer), the slot stays locked. No retry can pay twice, and the invoice is marked for reconciliation (`python main.py reconcile`; `doctor` reports these). Invoices left "approved but unpaid" by a crash are finished by `reconcile`. | **Agents** |
+| **Unconfirmed payments** | If a payment's outcome is unknown (a crash, a timeout, an unclear bank answer), the slot stays locked. No retry can pay twice, and the invoice is marked for reconciliation with the bank (`python main.py doctor` reports these). Invoices left "approved but unpaid" by a crash are finished automatically by the next run. | **Agents** |
 | **One payment per invoice** | Enforced at the bank boundary (idempotent) | **Agents** |
 | Payment timing | Pay on the due date, not on approval; take early-payment discounts when the annualised return beats Acme's cost of capital [8%] (e.g. 2/10 Net 30 ≈ 37% annualised) | Manual (planned) |
 | Payment runs | [Twice weekly]; emergency payments need CFO approval and a written reason | Manual |

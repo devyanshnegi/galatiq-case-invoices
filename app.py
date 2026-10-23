@@ -41,7 +41,7 @@ with st.sidebar:
                                 help="Recorded on every action. The two-person rule needs two different people.")
         role = people[reviewer]
         st.caption(f"{review.ROLES[role]} · {limit_text(role)}. Switch reviewer to act as a second approver. "
-                   "(The roster stands in for SSO in this prototype.)")
+                   "(Placeholder names: the roster stands in for SSO in this prototype.)")
     else:
         st.session_state.setdefault("reviewer", "Dana Lee")
         st.session_state.setdefault("role", "vp_finance")

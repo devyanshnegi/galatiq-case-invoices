@@ -26,6 +26,7 @@ SEED_INVENTORY = [
 ]
 
 # Approved vendor master. Vendors not on this list are not blocked, but are flagged for review.
+# Placeholder data: names and addresses come from the sample invoices, plus a few invented vendors.
 SEED_VENDORS = [
     ("Widgets Inc.", [], "100 Main St, Chicago, IL 60601"),
     ("Gadgets Co.", [], None),

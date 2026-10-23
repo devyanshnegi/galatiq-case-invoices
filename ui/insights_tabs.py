@@ -152,14 +152,17 @@ def about_tab() -> None:
   exception that needs two approvers including the CFO. Duplicates and prompt-injection attacks can never be reopened.
 - Every human action is in the audit trail and becomes a precedent the agents learn from.
 """)
+    # The same graph as the README's Workflow section - keep the two in step.
     st.graphviz_chart("""
 digraph G { rankdir=LR; node [shape=box, style="rounded,filled", fillcolor="#eef2ff", fontname="Helvetica"];
-  load -> extract [label="free text"]; load -> self_check [label="structured"]; load -> failed [label="unreadable"];
-  extract -> self_check; self_check -> extract [label="problems found", color="#d97706", fontcolor="#d97706"];
-  self_check -> validate; validate -> policy_decision [label="one allowed outcome"]; policy_decision -> guardrail;
-  validate -> review [label="discretion"]; review -> critique;
-  critique -> review [label="audit disagrees", color="#d97706", fontcolor="#d97706"];
-  critique -> guardrail [label="agrees / max rounds"]; guardrail -> payment;
-  payment -> human [label="escalated"]; human [label="human review\\n(1 or 2 approvers)", fillcolor="#fef3c7"];
-  payment [fillcolor="#dcfce7"]; failed [fillcolor="#fee2e2"]; }
+  L [label="Load file"]; X [label="Extract with LLM"]; S [label="Self-check vs document"];
+  FAIL [label="Logged as failed", fillcolor="#fee2e2"]; V [label="Validation"]; P [label="Fast-path decision"];
+  R [label="VP reviewer"]; C [label="Critic"]; G [label="Policy guardrail"];
+  PAY [label="Payment / rejection log /\nhuman review", fillcolor="#dcfce7"];
+  L -> X [label="TXT / PDF"]; L -> S [label="JSON / CSV / XML"]; L -> FAIL [label="unreadable"];
+  X -> S; S -> X [label="problems, attempts left", color="#d97706", fontcolor="#d97706"];
+  S -> V; V -> P [label="only one outcome allowed"]; V -> R [label="needs judgement"];
+  R -> C; C -> R [label="disagrees, rounds left", color="#d97706", fontcolor="#d97706"];
+  C -> G; P -> G; G -> PAY; }
 """)
+

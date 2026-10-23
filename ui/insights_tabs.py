@@ -5,21 +5,56 @@ from __future__ import annotations
 import json
 from collections import Counter
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
 from invoice_agents.db import Store
 from invoice_agents.jobqueue import JobQueue
 
-from .common import empty_state, money
+from .common import empty_state
 
 HUMAN_PREFIXES = ("Approved by", "Rejected by", "Reopened by")
+
+# Trace events -> what a finance reader would call the step.
+STEP_LABELS = {
+    "document_loaded": "Open the document",
+    "extracted": "Read the invoice",
+    "self_check": "Self-check vs document",
+    "rule_checks": "Rule checks (stock, maths, fraud)",
+    "risk_review": "Fraud check (AI)",
+    "risk_review_failed": "Fraud check (AI)",
+    "risk_review_skipped": "Fraud check (AI)",
+    "fast_path_decision": "Fast-path decision",
+    "draft_decision": "Reviewer decision (AI)",
+    "critique": "Audit critique (AI)",
+    "payment_executed": "Record and pay",
+    "rejection_logged": "Record and pay",
+    "queued_for_human_review": "Record and pay",
+}
+BAR_COLOR = "#4C78A8"  # one series per chart: a single calm hue, readable on light and dark backgrounds
+
+
+def _bars(data: pd.DataFrame, label: str, value: str, axis_title: str, fmt: str = "d") -> alt.LayerChart:
+    """Horizontal bars, longest first, full labels on the left and the value at the end of each bar."""
+    order = alt.SortField(value, order="descending")
+    base = alt.Chart(data).encode(
+        # labelOverlap=False: Vega otherwise hides labels it thinks are too close, which dropped rows on short charts.
+        y=alt.Y(f"{label}:N", sort=order, title=None,
+                axis=alt.Axis(labelLimit=320, labelFontSize=12, labelOverlap=False, labelPadding=6, ticks=False, domain=False)),
+        x=alt.X(f"{value}:Q", title=axis_title, axis=alt.Axis(grid=True, gridOpacity=0.15, tickCount=4, format=fmt)),
+        tooltip=[alt.Tooltip(f"{label}:N", title=label.capitalize()), alt.Tooltip(f"{value}:Q", title=axis_title, format=fmt)],
+    )
+    bars = base.mark_bar(color=BAR_COLOR, cornerRadiusEnd=4, height={"band": 0.7})
+    # Value labels in a mid grey: readable on both light and dark themes (the default black vanishes on dark).
+    labels = base.mark_text(align="left", dx=4, fontSize=12, color="#8B95A5").encode(text=alt.Text(f"{value}:Q", format=fmt))
+    return (bars + labels).properties(height=40 + 32 * len(data))  # room for every row plus the x axis
 
 
 def operations_tab(store: Store) -> None:
     rows = store.list_invoices()
     if not rows:
-        empty_state("📈", "No activity yet", "Process some invoices to see throughput, latency and business impact.")
+        empty_state("📈", "No activity yet", "Process some invoices to see throughput, latency and the most common findings.")
         return
     df = pd.DataFrame(rows)
     n = len(df)
@@ -41,48 +76,47 @@ def operations_tab(store: Store) -> None:
     stats = JobQueue(store).stats()
     st.caption(f"Job queue: {stats.queued} queued · {stats.running} running · {stats.done} done · {stats.failed} failed")
 
-    c1, c2 = st.columns(2)
+    timed = pd.DataFrame()
+    if not audit.empty:
+        audit["ms"] = audit["detail"].map(lambda d: json.loads(d).get("ms") if d else None)
+        timed = audit.dropna(subset=["ms"])
+
+    c1, c2 = st.columns(2, gap="large")
     with c1:
-        st.markdown("**Invoices processed per minute**")
-        per_min = pd.to_datetime(df["processed_at"]).dt.floor("min").value_counts().sort_index()
-        st.bar_chart(per_min.rename("invoices"), height=220)
+        st.markdown("**Where the time goes**")
+        if timed.empty:
+            st.caption("No timing data yet.")
+        else:
+            runs = max(timed["run_id"].nunique(), 1)
+            steps = (timed.assign(step=timed["event"].map(lambda e: STEP_LABELS.get(e, e.replace("_", " ").capitalize())))
+                     .groupby("step")["ms"].sum().div(1000 * runs).round(2).rename("seconds").reset_index())
+            steps = steps[steps["seconds"] > 0]
+            st.caption(f"Average seconds per invoice spent in each step, across {runs} invoice(s). "
+                       f"Together ≈ {steps['seconds'].sum():.1f}s per invoice; AI steps dominate when a model is used.")
+            st.altair_chart(_bars(steps, "step", "seconds", "Seconds per invoice", fmt=".2f"), width="stretch")
     with c2:
-        st.markdown("**Most common findings** (errors and warnings)")
+        st.markdown("**Most common findings**")
         codes: Counter = Counter()
         for rj in df["result_json"].dropna():
             for i in (json.loads(rj).get("validation") or {}).get("issues", []):
                 if i["severity"] != "info":
                     codes[i["code"]] += 1
         if codes:
-            st.bar_chart(pd.Series(dict(codes.most_common(10)), name="invoices").sort_values(), horizontal=True, height=220)
+            st.caption(f"Errors and warnings across {n} invoice(s) - what most often stops or holds an invoice.")
+            found = pd.DataFrame([{"finding": c.replace("_", " ").capitalize(), "invoices": v} for c, v in codes.most_common(12)])
+            st.altair_chart(_bars(found, "finding", "invoices", "Invoices"), width="stretch")
         else:
             st.caption("No findings yet.")
 
-    if not audit.empty:
-        audit["ms"] = audit["detail"].map(lambda d: json.loads(d).get("ms") if d else None)
-        timed = audit.dropna(subset=["ms"])
-        if not timed.empty:
-            st.markdown("**Where agent time goes** (per step)")
-            table = timed.groupby(["stage", "event"])["ms"].agg(count="count", p50=lambda x: x.quantile(0.5),
-                                                                p95=lambda x: x.quantile(0.95)).reset_index()
-            st.dataframe(table.sort_values("p95", ascending=False), hide_index=True, width="stretch")
-
-    st.markdown("##### Business impact estimate")
-    st.caption("Edit the assumptions; the rates come from this ledger. Defaults derive from the brief: "
-               "$2M/yr lost to manual processing.")
-    a = st.columns(3)
-    volume = a[0].number_input("Invoices per year", 1_000, 1_000_000, 25_000, step=1_000)
-    manual_cost = a[1].number_input("Fully-loaded manual cost per invoice ($)", 1.0, 500.0, 80.0, step=5.0, help="$2M / 25,000 invoices = $80")
-    review_share = a[2].slider("Human effort on an escalated invoice vs fully manual", 0.1, 1.0, 0.25)
-    blocked = df.loc[df["status"] == "rejected", "total"].clip(lower=0).sum()
-    processed_value = df["total"].clip(lower=0).sum() or 1
-    escalated = 1 - straight_through
-    savings = volume * manual_cost * (straight_through + escalated * (1 - review_share))
-    hours = volume * (straight_through + escalated * (1 - review_share)) * 15 / 60
-    b = st.columns(3)
-    b[0].metric("Processing cost avoided / yr", money(savings), border=True)
-    b[1].metric("AP staff hours freed / yr", f"{hours:,.0f}", help="Assumes 15 minutes of manual work per invoice", border=True)
-    b[2].metric("Bad spend blocked (share of value seen)", f"{blocked / processed_value:.0%}", help=f"{money(blocked)} blocked so far", border=True)
+    if not timed.empty:
+        with st.expander("Step timings in detail (milliseconds per step)"):
+            st.caption("p50 = median, p95 = the slowest 5% start here. Opening PDFs is slower than JSON/CSV/TXT, "
+                       "so 'document loaded' has a long tail when PDFs are in the mix.")
+            table = (timed.assign(step=timed["event"].map(lambda e: STEP_LABELS.get(e, e.replace("_", " ").capitalize())))
+                     .groupby("step")["ms"].agg(runs="count", p50=lambda x: x.quantile(0.5), p95=lambda x: x.quantile(0.95),
+                                                slowest="max").round(0).astype(int).reset_index())
+            st.dataframe(table.sort_values("p95", ascending=False), hide_index=True, width="stretch",
+                         column_config={"step": "Step", "runs": "Runs", "p50": "p50 (ms)", "p95": "p95 (ms)", "slowest": "Slowest (ms)"})
 
 
 def ledger_tab(store: Store) -> None:

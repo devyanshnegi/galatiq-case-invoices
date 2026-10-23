@@ -1,0 +1,270 @@
+"""Deterministic validation checks.
+
+Anything with a right answer - stock levels, arithmetic, dates, duplicates - is checked in code,
+never by the LLM. Each check is a pure function returning Issues, so they're trivially testable
+and the same checks are exposed to the LLM agents as tools.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from pathlib import Path
+from collections import defaultdict
+from datetime import date
+
+from .config import PolicySettings
+from .db import Store, normalize_name
+from .models import Invoice, Issue, Severity, ValidationReport
+from .normalize import parse_terms_days
+
+E, W, I = Severity.ERROR, Severity.WARNING, Severity.INFO
+MONEY_TOLERANCE = 0.01
+TERMS_TOLERANCE_DAYS = 3
+
+# Mock reference FX rates (no internet at runtime). A real deployment would pull treasury rates.
+FX_TO_USD = {"USD": 1.0, "EUR": 1.08, "GBP": 1.27, "CAD": 0.73}
+
+FRAUD_PATTERNS = {
+    r"\burgent\b": "urgency pressure ('URGENT')",
+    r"pay\s+immediately|immediate\s+payment": "demands immediate payment",
+    r"wire\s+transfer": "requests wire transfer",
+    r"avoid\s+penalt": "threatens penalties",
+    r"gift\s*card|bitcoin|crypto": "unusual payment method",
+    r"new\s+bank|bank\s+details\s+(have\s+)?changed|updated\s+account": "bank-detail change request",
+}
+
+
+def _close(a: float, b: float, tol: float = MONEY_TOLERANCE) -> bool:
+    return abs(a - b) <= tol
+
+
+def fingerprint(inv: Invoice) -> str:
+    """Identity of an invoice's *content*, used to tell an exact duplicate from a revision."""
+    key = f"{normalize_name(inv.vendor)}|{inv.invoice_number}|{inv.total}"
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def to_usd(amount: float | None, currency: str) -> float | None:
+    rate = FX_TO_USD.get((currency or "USD").upper())
+    return None if amount is None or rate is None else round(amount * rate, 2)
+
+
+# ---- individual checks ----------------------------------------------------------------------
+
+
+def check_required_fields(inv: Invoice) -> list[Issue]:
+    issues = []
+    if not inv.vendor:
+        issues.append(Issue(code="MISSING_VENDOR", severity=E, field="vendor", message="Vendor name is missing - cannot identify who to pay."))
+    if not inv.invoice_number:
+        issues.append(Issue(code="MISSING_INVOICE_NUMBER", severity=W, field="invoice_number", message="No invoice number - duplicate detection is unreliable."))
+    if not inv.line_items:
+        issues.append(Issue(code="NO_LINE_ITEMS", severity=E, field="line_items", message="No line items found on the invoice."))
+    if inv.total is None:
+        issues.append(Issue(code="MISSING_TOTAL", severity=E, field="total", message="No total amount found."))
+    if inv.due_date is None:
+        if inv.due_date_raw and inv.due_date_raw.strip():
+            issues.append(Issue(code="INVALID_DUE_DATE", severity=E, field="due_date",
+                                message=f"Due date '{inv.due_date_raw}' is not a real calendar date."))
+        else:
+            issues.append(Issue(code="MISSING_DUE_DATE", severity=E, field="due_date", message="Due date is missing."))
+    return issues
+
+
+def check_line_items(inv: Invoice, store: Store, policy: PolicySettings) -> list[Issue]:
+    issues: list[Issue] = []
+    requested: dict[str, float] = defaultdict(float)
+    lines_per_sku: dict[str, int] = defaultdict(int)
+    catalog: dict[str, dict] = {}
+
+    for n, li in enumerate(inv.line_items, start=1):
+        label = f"line {n} ({li.item})"
+        if li.quantity is None:
+            issues.append(Issue(code="MISSING_QUANTITY", severity=E, field=f"line_items[{n}]", message=f"{label}: quantity missing."))
+        elif li.quantity <= 0:
+            issues.append(Issue(code="INVALID_QUANTITY", severity=E, field=f"line_items[{n}]",
+                                message=f"{label}: quantity {li.quantity:g} is not positive - data integrity issue."))
+        elif li.quantity != int(li.quantity):
+            issues.append(Issue(code="FRACTIONAL_QUANTITY", severity=W, field=f"line_items[{n}]", message=f"{label}: fractional quantity {li.quantity:g}."))
+        if li.unit_price is not None and li.unit_price < 0:
+            issues.append(Issue(code="NEGATIVE_PRICE", severity=E, field=f"line_items[{n}]", message=f"{label}: negative unit price."))
+
+        row = store.match_item(li.item)
+        if row is None:
+            issues.append(Issue(code="UNKNOWN_ITEM", severity=E, field=f"line_items[{n}]",
+                                message=f"{label}: '{li.item}' is not in the inventory catalog."))
+            continue
+        li.sku = row["item"]
+        catalog[row["item"]] = row
+        lines_per_sku[row["item"]] += 1
+        if li.quantity and li.quantity > 0:
+            requested[row["item"]] += li.quantity
+
+        catalog_price = row["unit_price"] or 0
+        if li.unit_price is not None and catalog_price > 0 and inv.currency == policy.base_currency:
+            delta = (li.unit_price - catalog_price) / catalog_price
+            if delta > policy.price_variance_tolerance:
+                issues.append(Issue(code="PRICE_ABOVE_CATALOG", severity=W, field=f"line_items[{n}]",
+                                    message=f"{label}: ${li.unit_price:,.2f} is {delta:+.0%} vs catalog ${catalog_price:,.2f}"
+                                            + (f" (invoice note: '{li.note}')" if li.note else "") + "."))
+            elif delta < -policy.price_variance_tolerance:
+                issues.append(Issue(code="PRICE_BELOW_CATALOG", severity=I, field=f"line_items[{n}]",
+                                    message=f"{label}: ${li.unit_price:,.2f} is {delta:+.0%} vs catalog - discount."))
+
+    for sku, qty in requested.items():
+        row = catalog[sku]
+        if row["stock"] <= 0:
+            issues.append(Issue(code="OUT_OF_STOCK_ITEM", severity=E, field="line_items",
+                                message=f"{sku} has zero stock / is not orderable ({row['description']}) - suspicious."))
+        elif qty > row["stock"]:
+            spread = f" across {lines_per_sku[sku]} lines" if lines_per_sku[sku] > 1 else ""
+            issues.append(Issue(code="INSUFFICIENT_STOCK", severity=E, field="line_items",
+                                message=f"{sku}: invoice bills {qty:g} units{spread} but only {row['stock']} on record."))
+        elif lines_per_sku[sku] > 1:
+            issues.append(Issue(code="SPLIT_LINES", severity=I, field="line_items",
+                                message=f"{sku} appears on {lines_per_sku[sku]} lines ({qty:g} units total) - within stock."))
+    return issues
+
+
+def check_arithmetic(inv: Invoice) -> list[Issue]:
+    issues: list[Issue] = []
+    line_sum = 0.0
+    computable = bool(inv.line_items)
+    for n, li in enumerate(inv.line_items, start=1):
+        if li.quantity is None or li.unit_price is None:
+            computable = False
+            continue
+        expected = round(li.quantity * li.unit_price, 2)
+        if li.amount is not None and not _close(li.amount, expected):
+            issues.append(Issue(code="LINE_TOTAL_MISMATCH", severity=E, field=f"line_items[{n}]",
+                                message=f"line {n} ({li.item}): {li.quantity:g} x ${li.unit_price:,.2f} = ${expected:,.2f}, invoice says ${li.amount:,.2f}."))
+        line_sum += li.amount if li.amount is not None else expected
+
+    if computable and inv.subtotal is not None and not _close(line_sum, inv.subtotal):
+        issues.append(Issue(code="SUBTOTAL_MISMATCH", severity=E, field="subtotal",
+                            message=f"Line items sum to ${line_sum:,.2f} but subtotal says ${inv.subtotal:,.2f}."))
+    if inv.tax_rate and inv.subtotal is not None and inv.tax is not None:
+        expected_tax = round(inv.subtotal * inv.tax_rate, 2)
+        if not _close(expected_tax, inv.tax, 0.05):
+            issues.append(Issue(code="TAX_MISMATCH", severity=W, field="tax",
+                                message=f"Tax {inv.tax_rate:.0%} of ${inv.subtotal:,.2f} is ${expected_tax:,.2f}, invoice says ${inv.tax:,.2f}."))
+    base = inv.subtotal if inv.subtotal is not None else (line_sum if computable else None)
+    if base is not None and inv.total is not None:
+        expected_total = round(base + (inv.tax or 0) + (inv.shipping or 0), 2)
+        if not _close(expected_total, inv.total):
+            issues.append(Issue(code="TOTAL_MISMATCH", severity=E, field="total",
+                                message=f"Subtotal + tax + shipping = ${expected_total:,.2f} but total says ${inv.total:,.2f}."))
+    if inv.total is not None and inv.total <= 0:
+        issues.append(Issue(code="NON_POSITIVE_TOTAL", severity=E, field="total", message=f"Total ${inv.total:,.2f} is not a payable amount."))
+    return issues
+
+
+def check_dates(inv: Invoice, today: date | None = None) -> list[Issue]:
+    issues: list[Issue] = []
+    today = today or date.today()
+    if not inv.invoice_date:
+        issues.append(Issue(code="MISSING_INVOICE_DATE", severity=W, field="invoice_date", message="Invoice date missing."))
+    if not inv.due_date:
+        return issues
+    due = date.fromisoformat(inv.due_date)
+    if inv.invoice_date:
+        issued = date.fromisoformat(inv.invoice_date)
+        days = (due - issued).days
+        if days < 0:
+            issues.append(Issue(code="DUE_BEFORE_INVOICE", severity=E, field="due_date",
+                                message=f"Due date {inv.due_date} is before invoice date {inv.invoice_date}."))
+        terms_days = parse_terms_days(inv.payment_terms)
+        if terms_days is not None and days >= 0 and abs(days - terms_days) > TERMS_TOLERANCE_DAYS:
+            issues.append(Issue(code="TERMS_MISMATCH", severity=W, field="due_date",
+                                message=f"Terms say '{inv.payment_terms}' but due date is {days} days after the invoice date."))
+    if due < today:
+        issues.append(Issue(code="PAST_DUE", severity=I, field="due_date", message=f"Past due by {(today - due).days} days - check for late fees."))
+    return issues
+
+
+def check_vendor(inv: Invoice, store: Store) -> list[Issue]:
+    if not inv.vendor:
+        return []
+    row, match = store.find_vendor(inv.vendor)
+    if match == "none":
+        return [Issue(code="UNKNOWN_VENDOR", severity=W, field="vendor",
+                      message=f"'{inv.vendor}' is not in the approved vendor master - verify before first payment.")]
+    issues = []
+    if match == "fuzzy":
+        issues.append(Issue(code="VENDOR_NAME_VARIANT", severity=W, field="vendor",
+                            message=f"'{inv.vendor}' closely resembles approved vendor '{row['name']}' - confirm it's the same entity."))
+    elif match == "alias":
+        issues.append(Issue(code="VENDOR_ALIAS", severity=I, field="vendor", message=f"'{inv.vendor}' is a known alias of '{row['name']}'."))
+    if inv.vendor_address and row.get("address") and normalize_name(inv.vendor_address) != normalize_name(row["address"]):
+        issues.append(Issue(code="VENDOR_ADDRESS_MISMATCH", severity=W, field="vendor_address",
+                            message=f"Remit address '{inv.vendor_address}' differs from address on file '{row['address']}'."))
+    return issues
+
+
+def check_currency(inv: Invoice, policy: PolicySettings) -> list[Issue]:
+    currency = (inv.currency or "USD").upper()
+    if currency == policy.base_currency:
+        return []
+    if currency not in FX_TO_USD:
+        return [Issue(code="UNSUPPORTED_CURRENCY", severity=E, field="currency", message=f"Currency {currency} is not supported.")]
+    usd = to_usd(inv.total, currency)
+    return [Issue(code="FOREIGN_CURRENCY", severity=W, field="currency",
+                  message=f"Invoice is in {currency} (~${usd:,.2f} USD at reference rate {FX_TO_USD[currency]}); "
+                          "catalog prices can't be compared and treasury must confirm the FX rate.")]
+
+
+def check_duplicates(inv: Invoice, store: Store) -> list[Issue]:
+    issues: list[Issue] = []
+    fp = fingerprint(inv)
+    for prior in store.find_prior_invoices(inv.invoice_number, inv.vendor):
+        same_vendor = normalize_name(prior["vendor"]) == normalize_name(inv.vendor)
+        where = f"{Path(prior['source_file'] or 'unknown file').name} on {prior['processed_at'][:10]}"
+        if prior["status"] in {"paid", "pending_review"}:
+            if prior["fingerprint"] == fp:
+                issues.append(Issue(code="DUPLICATE_INVOICE", severity=E, field="invoice_number",
+                                    message=f"{inv.invoice_number} was already {prior['status'].replace('_', ' ')} ({where}) - duplicate."))
+            elif same_vendor:
+                issues.append(Issue(code="REVISED_INVOICE", severity=W, field="invoice_number",
+                                    message=f"{inv.invoice_number} was already {prior['status'].replace('_', ' ')} for ${prior['total']:,.2f} ({where}); "
+                                            f"this version is ${inv.total or 0:,.2f}. Pay at most the difference, after confirming the PO amendment."))
+            else:
+                issues.append(Issue(code="INVOICE_NUMBER_COLLISION", severity=W, field="invoice_number",
+                                    message=f"{inv.invoice_number} was already used by a different vendor ({prior['vendor']})."))
+        elif prior["status"] == "rejected":
+            issues.append(Issue(code="PREVIOUSLY_REJECTED", severity=I, field="invoice_number",
+                                message=f"{inv.invoice_number} was previously rejected ({where}) - this is a resubmission."))
+    if inv.revision and not any(i.code == "REVISED_INVOICE" for i in issues):
+        issues.append(Issue(code="REVISION_MARKER", severity=I, field="revision", message=f"Marked as revision '{inv.revision}'."))
+    return issues
+
+
+def check_fraud_signals(inv: Invoice, raw_text: str) -> list[Issue]:
+    text = f"{raw_text}\n{inv.notes or ''}\n{inv.payment_terms or ''}"
+    hits = [label for pattern, label in FRAUD_PATTERNS.items() if re.search(pattern, text, re.I)]
+    if not hits:
+        return []
+    return [Issue(code="FRAUD_SIGNALS", severity=W, field="notes", message="Social-engineering red flags: " + "; ".join(hits) + ".")]
+
+
+# ---- orchestration --------------------------------------------------------------------------
+
+CHECKS = ["required_fields", "line_items_and_stock", "arithmetic", "dates", "vendor", "currency", "duplicates", "fraud_signals"]
+
+
+def run_all_checks(inv: Invoice, raw_text: str, store: Store, policy: PolicySettings, today: date | None = None) -> ValidationReport:
+    issues = [
+        *check_required_fields(inv),
+        *check_line_items(inv, store, policy),
+        *check_arithmetic(inv),
+        *check_dates(inv, today),
+        *check_vendor(inv, store),
+        *check_currency(inv, policy),
+        *check_duplicates(inv, store),
+        *check_fraud_signals(inv, raw_text),
+    ]
+    rank = {E: 0, W: 1, I: 2}
+    issues.sort(key=lambda i: rank[i.severity])  # stable: keeps check order within a severity
+    report = ValidationReport(issues=issues, checks_run=list(CHECKS), total_usd=to_usd(inv.total, inv.currency))
+    report.risk_score = min(100, 35 * len(report.errors) + 12 * len(report.warnings))
+    return report

@@ -1,0 +1,11 @@
+langgraph==1.2.16
+pydantic==2.14.1
+openai==3.37.0          # OpenAI-compatible client: Ollama, xAI Grok, OpenAI
+anthropic==2.1.0        # Claude
+pdfplumber==0.11.10
+python-dateutil==3.0.0
+python-dotenv==1.2.4
+rich==15.0.0
+streamlit==1.66.1
+pandas==3.1.0
+pytest==9.1.1

@@ -15,7 +15,7 @@ import logging
 import time
 
 from .. import prompts
-from ..llm import LLMError, Tool
+from ..llm import LLMError
 from ..models import ApprovalDecision, Critique, Invoice, ValidationReport
 from ..policy import policy_text
 from ..state import AgentContext, InvoiceState, trace_event
@@ -23,41 +23,7 @@ from ..state import AgentContext, InvoiceState, trace_event
 log = logging.getLogger(__name__)
 
 
-# ---- tools the reviewer can call --------------------------------------------------------------
-
-
-def reviewer_tools(ctx: AgentContext) -> list[Tool]:
-    store = ctx.store
-
-    def lookup_inventory(item: str):
-        row = store.match_item(item)
-        return row or {"found": False, "item": item, "note": "not in inventory catalog"}
-
-    def get_vendor_profile(vendor: str):
-        row, match = store.find_vendor(vendor)
-        return {"match": match, "vendor": row} if row else {"match": "none", "note": f"'{vendor}' is not in the approved vendor master"}
-
-    def get_vendor_history(vendor: str):
-        return store.vendor_history(vendor)
-
-    def find_prior_invoices(invoice_number: str):
-        return store.find_prior_invoices(invoice_number, None) or {"note": "no prior invoices with this number"}
-
-    s = {"type": "object", "properties": {}, "required": []}
-    return [
-        Tool("get_approval_policy", "Get Acme Corp's binding invoice-approval policy.", s, lambda: policy_text(ctx.settings.policy)),
-        Tool("lookup_inventory", "Look up an item's stock level and catalog price.",
-             {"type": "object", "properties": {"item": {"type": "string"}}, "required": ["item"]}, lookup_inventory),
-        Tool("get_vendor_profile", "Check whether a vendor is in the approved vendor master, with address on file.",
-             {"type": "object", "properties": {"vendor": {"type": "string"}}, "required": ["vendor"]}, get_vendor_profile),
-        Tool("get_vendor_history", "Count of past invoices paid/rejected for a vendor and total paid.",
-             {"type": "object", "properties": {"vendor": {"type": "string"}}, "required": ["vendor"]}, get_vendor_history),
-        Tool("find_prior_invoices", "Find previously processed invoices with the same invoice number.",
-             {"type": "object", "properties": {"invoice_number": {"type": "string"}}, "required": ["invoice_number"]}, find_prior_invoices),
-    ]
-
-
-def case_file(state: InvoiceState) -> str:
+def case_file(state: InvoiceState, precedents: list[dict] | None = None) -> str:
     inv = state["invoice"]
     report = state["validation"]
 
@@ -76,6 +42,11 @@ def case_file(state: InvoiceState) -> str:
         f"allowed_outcomes = {state['policy']['allowed']}",
         *[f"- {r}" for r in state["policy"]["reasons"]],
     ]
+    if precedents:
+        lines += ["\nPRECEDENTS (how humans decided this vendor's earlier escalated invoices - weigh them, but the policy wins):",
+                  *[f"- {p['decided_at'][:10]} {p['invoice_number']}: {p['decision'].upper()} by {p['reviewer']}"
+                    f" (warnings: {', '.join(p['issue_codes']) or 'none'})" + (f" - note: {p['note']}" if p.get("note") else "")
+                    for p in precedents]]
     return "\n".join(lines)
 
 
@@ -99,7 +70,8 @@ def review_node(ctx: AgentContext):
                 events.append(trace_event("approval", "llm_review_failed", None, error=str(exc)))
         method = "llm" if decision else "rules"
         if decision is None:
-            decision = rule_based_decision(Invoice(**state["invoice"]), ValidationReport(**state["validation"]), state["policy"])
+            inv = Invoice(**state["invoice"])
+            decision = rule_based_decision(inv, ValidationReport(**state["validation"]), state["policy"], ctx.store.vendor_precedents(inv.vendor))
         events.append(trace_event("approval", "draft_decision", started, round=round_no, method=method, **decision.model_dump()))
         return {"review_round": round_no, "draft_decision": {**decision.model_dump(), "method": method}, "trace": events}
 
@@ -107,14 +79,14 @@ def review_node(ctx: AgentContext):
 
 
 def _llm_review(ctx: AgentContext, state: InvoiceState, critiques: list[dict]):
-    brief = case_file(state)
+    brief = case_file(state, ctx.store.vendor_precedents(state["invoice"].get("vendor")))
     if critiques:
         last = critiques[-1]
         brief += ("\n\nINTERNAL AUDIT REJECTED YOUR PREVIOUS DRAFT:\n"
                   f"previous decision: {state['draft_decision']['decision']}\n"
                   + "\n".join(f"- {p}" for p in last["problems"])
                   + f"\naudit recommends: {last['recommended_decision']}")
-    investigation = ctx.llm.run_tools(system=prompts.REVIEWER, user=brief, tools=reviewer_tools(ctx), max_steps=4)
+    investigation = ctx.llm.run_tools(system=prompts.REVIEWER, user=brief, tools=ctx.backend.reviewer_tools(), max_steps=4)
     findings = "\n".join(f"- {c.name}({c.arguments}) -> {json.dumps(c.result, default=str)[:400]}" for c in investigation.calls)
     decision = ctx.llm.structured(
         system=prompts.REVIEWER_DECIDE,
@@ -124,7 +96,7 @@ def _llm_review(ctx: AgentContext, state: InvoiceState, critiques: list[dict]):
     return decision, investigation.calls
 
 
-def rule_based_decision(inv: Invoice, report: ValidationReport, policy: dict) -> ApprovalDecision:
+def rule_based_decision(inv: Invoice, report: ValidationReport, policy: dict, precedents: list[dict] | None = None) -> ApprovalDecision:
     """Deterministic reviewer used offline or when the LLM is unavailable."""
     decision = policy["recommended"]
     factors = [f"{i.code}: {i.message}" for i in report.errors + report.warnings]
@@ -139,16 +111,54 @@ def rule_based_decision(inv: Invoice, report: ValidationReport, policy: dict) ->
         decision = "approve"
         conditions.append("Price premium accepted because the invoice documents it; confirm with the requester.")
 
+    # Learned precedent: humans repeatedly approved this vendor with exactly these warnings and never rejected.
+    warning_codes = sorted({w.code for w in report.warnings})
+    same = [p for p in precedents or [] if p["issue_codes"] == warning_codes]
+    if (decision == "escalate" and "approve" in policy["allowed"] and warning_codes
+            and len(same) >= 2 and all(p["decision"] == "approve" for p in same)):
+        decision = "approve"
+        conditions.append(f"Approved on precedent: humans approved {len(same)} earlier {inv.vendor} invoices with the same "
+                          f"warnings ({', '.join(warning_codes)}), most recently {same[0]['decided_at'][:10]} by {same[0]['reviewer']}.")
+
     if decision == "reject":
         reasoning = (f"Rejecting {inv.invoice_number or 'this invoice'} from {inv.vendor or 'an unidentified vendor'} for {amount}: "
                      f"{len(report.errors)} blocking issue(s) - " + "; ".join(i.message for i in report.errors[:3]))
     elif decision == "escalate":
         reasoning = (f"Escalating {inv.invoice_number} ({amount}) to a human approver: " + "; ".join(policy["reasons"]))
         conditions.append("Human approver must confirm before payment.")
+        if same:
+            verdicts = ", ".join(f"{p['decision']} ({p['decided_at'][:10]})" for p in same[:3])
+            reasoning += f" Precedent for this vendor with the same warnings: {verdicts}."
     else:
         reasoning = (f"Approving {inv.invoice_number} from {inv.vendor} for {amount}: all items are in the catalog and within stock, "
                      "the arithmetic reconciles and the due date is valid" + (", and the noted exceptions are documented." if report.warnings else "."))
     return ApprovalDecision(decision=decision, reasoning=reasoning, key_factors=factors[:6] or ["all checks passed"], conditions=conditions)
+
+
+def policy_decision_node(ctx: AgentContext):
+    """Fast path: the policy allows exactly one outcome, so there's nothing for an LLM to deliberate.
+
+    A clean small invoice can only be approved; one with a blocking error can only be rejected.
+    Skipping the reviewer/critic here is what makes high volume affordable: LLM calls are spent
+    only on invoices where judgement actually changes the outcome.
+    """
+
+    def decide(state: InvoiceState) -> InvoiceState:
+        started = time.perf_counter()
+        inv = Invoice(**state["invoice"])
+        decision = rule_based_decision(inv, ValidationReport(**state["validation"]), state["policy"], ctx.store.vendor_precedents(inv.vendor))
+        return {"review_round": 0, "draft_decision": {**decision.model_dump(), "method": "policy"},
+                "trace": [trace_event("approval", "fast_path_decision", started, decision=decision.decision,
+                                      reason=f"policy allows only '{decision.decision}' - no deliberation needed")]}
+
+    return decide
+
+
+def needs_deliberation(ctx: AgentContext):
+    def route(state: InvoiceState) -> str:
+        return "fast_path" if ctx.settings.fast_path and len(state["policy"]["allowed"]) == 1 else "deliberate"
+
+    return route
 
 
 # ---- critic -----------------------------------------------------------------------------------

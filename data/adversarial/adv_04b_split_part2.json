@@ -1,0 +1,16 @@
+{
+  "invoice_number": "INV-2042",
+  "vendor": {"name": "Reliable Components Inc.", "address": null},
+  "date": "2026-10-07",
+  "due_date": "2026-11-06",
+  "line_items": [
+    {"item": "WidgetB", "quantity": 6, "unit_price": 500.00, "amount": 3000.00},
+    {"item": "GadgetX", "quantity": 4, "unit_price": 750.00, "amount": 3000.00}
+  ],
+  "subtotal": 6000.00,
+  "tax_rate": 0.0,
+  "tax_amount": 0.00,
+  "total": 6000.00,
+  "currency": "USD",
+  "payment_terms": "Net 30"
+}

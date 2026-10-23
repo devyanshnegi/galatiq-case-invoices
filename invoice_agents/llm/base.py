@@ -15,7 +15,9 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import threading
 import time
+from contextvars import ContextVar
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, TypeVar
@@ -82,6 +84,11 @@ class LLMUsage:
     seconds: float = 0.0
 
 
+# Per-invoice call counter. Set by the pipeline for each run so concurrent invoices sharing one
+# client still get their own count (the value is a mutable list so LangGraph's copied contexts share it).
+RUN_CALLS: ContextVar[list[int] | None] = ContextVar("RUN_CALLS", default=None)
+
+
 def inline_schema(model: type[BaseModel]) -> dict[str, Any]:
     """Pydantic JSON schema with all `$ref`s inlined.
 
@@ -128,6 +135,15 @@ class LLMClient(ABC):
         self.temperature = temperature
         self.timeout_s = timeout_s
         self.usage = LLMUsage()
+        self._usage_lock = threading.Lock()
+
+    def _record(self, seconds: float) -> None:
+        with self._usage_lock:
+            self.usage.calls += 1
+            self.usage.seconds += seconds
+        counter = RUN_CALLS.get()
+        if counter is not None:
+            counter[0] += 1
 
     @property
     def label(self) -> str:
@@ -165,8 +181,7 @@ class LLMClient(ABC):
             except Exception as exc:  # network / auth / server errors
                 raise LLMError(f"{self.label} request failed: {exc}") from exc
             finally:
-                self.usage.calls += 1
-                self.usage.seconds += time.perf_counter() - started
+                self._record(time.perf_counter() - started)
             try:
                 return schema.model_validate(_extract_json(raw))
             except (json.JSONDecodeError, ValidationError) as exc:
@@ -194,8 +209,7 @@ class LLMClient(ABC):
             except Exception as exc:
                 raise LLMError(f"{self.label} tool call failed: {exc}") from exc
             finally:
-                self.usage.calls += 1
-                self.usage.seconds += time.perf_counter() - started
+                self._record(time.perf_counter() - started)
             if not step.tool_calls:
                 return ToolLoopResult(text=step.text, calls=records)
             results = []
@@ -206,5 +220,7 @@ class LLMClient(ABC):
                 results.append((call, json.dumps(result, default=str)))
             self._append_tool_results(history, step, results)
         history.append(self._user_message("Stop calling tools now and give your final summary."))
+        started = time.perf_counter()
         step = self._tool_step(system, history, [])
+        self._record(time.perf_counter() - started)
         return ToolLoopResult(text=step.text, calls=records)

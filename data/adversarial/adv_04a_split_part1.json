@@ -1,0 +1,16 @@
+{
+  "invoice_number": "INV-2041",
+  "vendor": {"name": "Reliable Components Inc.", "address": null},
+  "date": "2026-10-05",
+  "due_date": "2026-11-04",
+  "line_items": [
+    {"item": "WidgetA", "quantity": 10, "unit_price": 250.00, "amount": 2500.00},
+    {"item": "WidgetB", "quantity": 7, "unit_price": 500.00, "amount": 3500.00}
+  ],
+  "subtotal": 6000.00,
+  "tax_rate": 0.0,
+  "tax_amount": 0.00,
+  "total": 6000.00,
+  "currency": "USD",
+  "payment_terms": "Net 30"
+}

@@ -9,7 +9,8 @@ import argparse
 import json
 import re
 import sqlite3
-from contextlib import contextmanager
+import threading
+from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -66,9 +67,46 @@ CREATE TABLE IF NOT EXISTS invoices (
     reasoning TEXT,
     source_file TEXT,
     result_json TEXT,
+    llm_calls INTEGER,
+    duration_ms INTEGER,
     processed_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+-- Race-safe duplicate protection: with parallel workers, two copies of one invoice can pass the
+-- duplicate *check* at the same moment. The database refuses the second payable record.
+CREATE UNIQUE INDEX IF NOT EXISTS one_payable_record_per_invoice
+    ON invoices(fingerprint) WHERE status IN ('approved', 'paid', 'pending_review') AND fingerprint IS NOT NULL;
+CREATE INDEX IF NOT EXISTS invoices_by_number ON invoices(invoice_number);
+CREATE INDEX IF NOT EXISTS invoices_by_run ON invoices(run_id);
+CREATE TABLE IF NOT EXISTS jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    path TEXT NOT NULL,
+    file_hash TEXT NOT NULL,
+    status TEXT NOT NULL,            -- queued | running | done | failed
+    attempts INTEGER NOT NULL DEFAULT 0,
+    run_id TEXT,
+    invoice_id INTEGER,
+    outcome TEXT,
+    error TEXT,
+    available_at TEXT NOT NULL,
+    enqueued_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS one_job_per_file ON jobs(file_hash);
+CREATE INDEX IF NOT EXISTS jobs_by_status ON jobs(status, available_at);
+CREATE TABLE IF NOT EXISTS human_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    vendor_key TEXT NOT NULL,
+    vendor TEXT,
+    invoice_number TEXT,
+    issue_codes TEXT NOT NULL,       -- JSON list of warning codes the human saw
+    decision TEXT NOT NULL,
+    note TEXT,
+    reviewer TEXT,
+    decided_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS human_decisions_by_vendor ON human_decisions(vendor_key);
 CREATE TABLE IF NOT EXISTS payments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     invoice_id INTEGER REFERENCES invoices(id),
@@ -80,6 +118,7 @@ CREATE TABLE IF NOT EXISTS payments (
     status TEXT,
     paid_at TEXT NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS one_payment_per_invoice ON payments(invoice_id);
 CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT NOT NULL,
@@ -92,6 +131,10 @@ CREATE TABLE IF NOT EXISTS audit_log (
 """
 
 _SUFFIXES = re.compile(r"\b(inc|incorporated|co|corp|corporation|company|ltd|limited|llc|plc|group)\b\.?")
+
+
+class DuplicateRecord(Exception):
+    """A payable record for this invoice already exists (enforced by the database)."""
 
 
 def now_iso() -> str:
@@ -115,25 +158,77 @@ def normalize_sku(name: str | None) -> str:
 
 
 class Store:
+    """SQLite access with one long-lived connection per thread.
+
+    Opening/closing a connection per query is expensive in WAL mode (closing the last connection
+    checkpoints the log), and was the single biggest cost at volume. Each worker thread reuses its own
+    connection; `connect()` blocks commit as one transaction (nested blocks join the outer one).
+    """
+
     def __init__(self, path: str | Path):
         self.path = Path(path)
+        self._local = threading.local()
+        self._all: list[tuple[threading.Thread, sqlite3.Connection]] = []
+        self._all_lock = threading.Lock()
+
+    def _conn(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout = 30000")
+            conn.execute("PRAGMA synchronous = NORMAL")  # standard for WAL: durable across app crashes
+            self._local.conn, self._local.depth = conn, 0
+            with self._all_lock:
+                # Threads come and go (worker pools, a UI thread per page refresh): close connections
+                # whose thread has finished so they don't accumulate and pin old WAL snapshots.
+                for thread, old in [t for t in self._all if not t[0].is_alive()]:
+                    with suppress(sqlite3.ProgrammingError):
+                        old.close()
+                self._all = [t for t in self._all if t[0].is_alive()]
+                self._all.append((threading.current_thread(), conn))
+        return conn
+
+    def open_connections(self) -> int:
+        with self._all_lock:
+            return len(self._all)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.path)
-        conn.row_factory = sqlite3.Row
+        conn = self._conn()
+        self._local.depth += 1
         try:
             yield conn
-            conn.commit()
+            if self._local.depth == 1:
+                conn.commit()
+        except BaseException:
+            if self._local.depth == 1:
+                conn.rollback()
+            raise
         finally:
-            conn.close()
+            self._local.depth -= 1
+
+    def close(self) -> None:
+        with self._all_lock:
+            for _, conn in self._all:
+                with suppress(sqlite3.ProgrammingError):
+                    conn.close()
+            self._all.clear()
+        self._local = threading.local()
 
     # ---- setup ---------------------------------------------------------------------------
 
     def init(self, reset: bool = False) -> None:
-        if reset and self.path.exists():
-            self.path.unlink()
+        if reset:
+            self.close()
+            for suffix in ("", "-wal", "-shm"):
+                Path(f"{self.path}{suffix}").unlink(missing_ok=True)
         with self.connect() as conn:
+            conn.execute("PRAGMA journal_mode = WAL")  # readers don't block the writer: needed for parallel workers
+            for column in ("llm_calls INTEGER", "duration_ms INTEGER"):  # upgrade databases from v1
+                with suppress(sqlite3.OperationalError):
+                    conn.execute(f"ALTER TABLE invoices ADD COLUMN {column}")
+            conn.execute("DROP INDEX IF EXISTS one_payable_record_per_invoice")  # recreated below with current definition
             conn.executescript(SCHEMA)
             conn.executemany("INSERT OR IGNORE INTO inventory VALUES (?, ?, ?, ?, ?)", SEED_INVENTORY)
             conn.executemany(
@@ -144,7 +239,8 @@ class Store:
     def reset_ledger(self) -> None:
         """Clear processed invoices/payments but keep master data."""
         with self.connect() as conn:
-            conn.executescript("DELETE FROM payments; DELETE FROM invoices; DELETE FROM audit_log;")
+            conn.executescript("DELETE FROM payments; DELETE FROM invoices; DELETE FROM audit_log; "
+                               "DELETE FROM jobs; DELETE FROM human_decisions;")
 
     # ---- master data ---------------------------------------------------------------------
 
@@ -213,17 +309,65 @@ class Store:
         }
 
     def record_invoice(self, *, run_id: str, invoice: dict, status: str, decision: str | None, reasoning: str | None,
-                       fingerprint: str | None, source_file: str | None, result: dict) -> int:
+                       fingerprint: str | None, source_file: str | None, result: dict,
+                       llm_calls: int | None = None, duration_ms: int | None = None) -> int:
         ts = now_iso()
+        try:
+            with self.connect() as conn:
+                cur = conn.execute(
+                    "INSERT INTO invoices (run_id, invoice_number, vendor, total, currency, fingerprint, status, decision, "
+                    "reasoning, source_file, result_json, llm_calls, duration_ms, processed_at, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (run_id, invoice.get("invoice_number"), invoice.get("vendor"), invoice.get("total"),
+                     invoice.get("currency"), fingerprint, status, decision, reasoning, source_file,
+                     json.dumps(result, default=str), llm_calls, duration_ms, ts, ts),
+                )
+                return int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            if "one_payable_record_per_invoice" in str(exc) or "invoices.fingerprint" in str(exc):
+                raise DuplicateRecord(invoice.get("invoice_number")) from exc
+            raise
+
+    def invoice_for_run(self, run_id: str) -> dict[str, Any] | None:
         with self.connect() as conn:
-            cur = conn.execute(
-                "INSERT INTO invoices (run_id, invoice_number, vendor, total, currency, fingerprint, status, decision, "
-                "reasoning, source_file, result_json, processed_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (run_id, invoice.get("invoice_number"), invoice.get("vendor"), invoice.get("total"),
-                 invoice.get("currency"), fingerprint, status, decision, reasoning, source_file,
-                 json.dumps(result, default=str), ts, ts),
+            row = conn.execute("SELECT * FROM invoices WHERE run_id = ? ORDER BY id DESC LIMIT 1", (run_id,)).fetchone()
+        return dict(row) if row else None
+
+    def recent_vendor_invoices(self, vendor: str | None, around: str | None, days: int) -> list[dict[str, Any]]:
+        """Payable invoices from the same vendor dated within `days` of `around` (for split-invoice detection)."""
+        if not vendor or not around:
+            return []
+        key = normalize_name(vendor)
+        with self.connect() as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT id, invoice_number, vendor, total, status, result_json FROM invoices "
+                "WHERE status IN ('approved', 'paid', 'pending_review')")]
+        out = []
+        for r in rows:
+            if normalize_name(r["vendor"]) != key:
+                continue
+            inv_date = (json.loads(r["result_json"] or "{}").get("invoice") or {}).get("invoice_date")
+            if inv_date and abs((datetime.fromisoformat(inv_date) - datetime.fromisoformat(around)).days) <= days:
+                out.append({k: r[k] for k in ("id", "invoice_number", "total", "status")} | {"invoice_date": inv_date})
+        return out
+
+    # ---- human decision memory ----------------------------------------------------------
+
+    def remember_human_decision(self, *, vendor: str | None, invoice_number: str | None, issue_codes: list[str],
+                                decision: str, note: str, reviewer: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO human_decisions (vendor_key, vendor, invoice_number, issue_codes, decision, note, reviewer, decided_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (normalize_name(vendor), vendor, invoice_number, json.dumps(sorted(issue_codes)), decision, note, reviewer, now_iso()),
             )
-            return int(cur.lastrowid)
+
+    def vendor_precedents(self, vendor: str | None, limit: int = 5) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT vendor, invoice_number, issue_codes, decision, note, reviewer, decided_at FROM human_decisions "
+                "WHERE vendor_key = ? ORDER BY id DESC LIMIT ?", (normalize_name(vendor), limit)).fetchall()
+        return [dict(r) | {"issue_codes": json.loads(r["issue_codes"])} for r in rows]
 
     def update_invoice_status(self, invoice_id: int, status: str, decision: str, reasoning: str) -> None:
         with self.connect() as conn:
@@ -246,16 +390,33 @@ class Store:
 
     def is_paid(self, invoice_id: int) -> bool:
         with self.connect() as conn:
-            return conn.execute("SELECT 1 FROM payments WHERE invoice_id = ?", (invoice_id,)).fetchone() is not None
+            return conn.execute("SELECT 1 FROM payments WHERE invoice_id = ? AND status = 'success'", (invoice_id,)).fetchone() is not None
 
-    def record_payment(self, *, invoice_id: int, invoice_number: str | None, vendor: str, amount: float,
-                       currency: str, reference: str, status: str) -> None:
+    def claim_payment(self, *, invoice_id: int, invoice_number: str | None, vendor: str, amount: float,
+                      currency: str, reference: str) -> bool:
+        """Reserve the payment slot for an invoice *before* calling the bank. False if already claimed."""
+        try:
+            with self.connect() as conn:
+                conn.execute(
+                    "INSERT INTO payments (invoice_id, invoice_number, vendor, amount, currency, reference, status, paid_at) "
+                    "VALUES (?,?,?,?,?,?,'processing',?)",
+                    (invoice_id, invoice_number, vendor, amount, currency, reference, now_iso()),
+                )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def finish_payment(self, reference: str, status: str) -> None:
         with self.connect() as conn:
-            conn.execute(
-                "INSERT INTO payments (invoice_id, invoice_number, vendor, amount, currency, reference, status, paid_at) "
-                "VALUES (?,?,?,?,?,?,?,?)",
-                (invoice_id, invoice_number, vendor, amount, currency, reference, status, now_iso()),
-            )
+            if status == "success":
+                conn.execute("UPDATE payments SET status = ?, paid_at = ? WHERE reference = ?", (status, now_iso(), reference))
+            else:  # free the slot so a later retry can pay
+                conn.execute("DELETE FROM payments WHERE reference = ?", (reference,))
+
+    def payment_for_invoice(self, invoice_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM payments WHERE invoice_id = ?", (invoice_id,)).fetchone()
+        return dict(row) if row else None
 
     def list_payments(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -269,6 +430,21 @@ class Store:
                 "INSERT INTO audit_log (ts, run_id, invoice_number, stage, event, detail) VALUES (?,?,?,?,?,?)",
                 (now_iso(), run_id, invoice_number, stage, event, json.dumps(detail, default=str)),
             )
+
+    def audit_many(self, events: list[dict[str, Any]]) -> None:
+        """One transaction per invoice instead of one per event - matters at volume."""
+        if not events:
+            return
+        ts = now_iso()
+        with self.connect() as conn:
+            conn.executemany(
+                "INSERT INTO audit_log (ts, run_id, invoice_number, stage, event, detail) VALUES (?,?,?,?,?,?)",
+                [(ts, e["run_id"], e["invoice_number"], e["stage"], e["event"], json.dumps(e["detail"], default=str)) for e in events],
+            )
+
+    def set_run_metrics(self, invoice_id: int, *, llm_calls: int, duration_ms: int) -> None:
+        with self.connect() as conn:
+            conn.execute("UPDATE invoices SET llm_calls = ?, duration_ms = ? WHERE id = ?", (llm_calls, duration_ms, invoice_id))
 
     def list_audit(self, limit: int = 500) -> list[dict[str, Any]]:
         with self.connect() as conn:

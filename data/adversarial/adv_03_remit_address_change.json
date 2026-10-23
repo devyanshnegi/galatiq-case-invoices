@@ -1,0 +1,18 @@
+{
+  "invoice_number": "INV-2003",
+  "vendor": {
+    "name": "Atlas Industrial Supply",
+    "address": "PO Box 4471, Road Town, Tortola, British Virgin Islands"
+  },
+  "date": "2026-10-03",
+  "due_date": "2026-11-02",
+  "line_items": [
+    {"item": "GadgetX", "quantity": 2, "unit_price": 750.00, "amount": 1500.00}
+  ],
+  "subtotal": 1500.00,
+  "tax_rate": 0.0,
+  "tax_amount": 0.00,
+  "total": 1500.00,
+  "currency": "USD",
+  "payment_terms": "Net 30"
+}

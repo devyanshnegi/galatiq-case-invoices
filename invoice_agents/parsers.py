@@ -226,7 +226,7 @@ def _from_xml(text: str) -> Invoice:
 # ---- free text: offline heuristic extractor -----------------------------------------------
 
 _STOP = r"(?=\s{2,}|\s+(?:due(?:\s*(?:date|dt))?|date|dt|terms|vendor)\s*:|$)"
-_MONEY = r"\(?-?\$?\s*[\d,]+(?:\.[\dOo]{1,2})?\)?"
+_MONEY = r"\(?-?\$?\s*-?[\d,]+(?:\.[\dOo]{1,2})?\)?"  # also '$-1,575.00'
 
 _ITEM_LINE = re.compile(
     r"^\s*(?:[-*•]\s*)?"

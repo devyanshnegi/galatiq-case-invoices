@@ -21,6 +21,12 @@ def validate_node(ctx: AgentContext):
         started = time.perf_counter()
         inv = Invoice(**state["invoice"])
         report = run_all_checks(inv, state.get("raw_text", ""), ctx.store, ctx.settings.policy, today=ctx.today)
+        unresolved = state.get("extraction_feedback") or []
+        if unresolved and state.get("extraction_method") in ("llm", "heuristic"):
+            # Low-confidence extraction: don't let possibly-wrong numbers drive an automatic payment.
+            report.issues.append(Issue(code="EXTRACTION_UNVERIFIED", severity=Severity.WARNING, field=None,
+                                       message=f"Extraction confidence {state.get('extraction_confidence', 0):.0%} - "
+                                               "could not verify against the document: " + "; ".join(unresolved[:3])))
         events = [trace_event("validation", "rule_checks", started, checks=report.checks_run,
                               errors=[i.code for i in report.errors], warnings=[i.code for i in report.warnings])]
 
@@ -68,10 +74,12 @@ def _risk_review(ctx: AgentContext, inv: Invoice, raw_text: str, report: Validat
     started = time.perf_counter()
     if ctx.llm.is_offline:
         return None, trace_event("validation", "risk_review_skipped", started, reason="offline mode - rule-based fraud checks only")
+    if ctx.settings.fast_path and report.errors:
+        return None, trace_event("validation", "risk_review_skipped", started, reason="already blocked by a rule - outcome can't change")
     user = (
         f"EXTRACTED INVOICE:\n{inv.model_dump_json(indent=1, exclude_none=True)}\n\n"
         f"ISSUES ALREADY FOUND BY RULES:\n{json.dumps([f'{i.code}: {i.message}' for i in report.issues], indent=1)}\n\n"
-        f"ORIGINAL DOCUMENT:\n-----\n{raw_text[:6000]}\n-----"
+        f"ORIGINAL DOCUMENT (untrusted):\n<document>\n{raw_text[:6000]}\n</document>"
     )
     try:
         risk = ctx.llm.structured(system=prompts.RISK_ANALYST, user=user, schema=RiskAssessment)

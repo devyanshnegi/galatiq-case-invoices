@@ -1,0 +1,23 @@
+From: accounts@summit-manufacturing.co
+To: ap@acmecorp.com
+Subject: Updated remittance details - invoice INV-2002
+
+Hello,
+
+Please note our bank details have changed. Kindly remit this and all future payments
+to our new account (details attached). Old account is closed.
+
+  Vendor: Summit Manufacturing Co.
+  Invoice: INV-2002
+  Date: 2026-10-02
+  Due: 2026-11-01
+
+  Items:
+    - WidgetB       x3      $500.00 each
+
+  Total: $1,500.00
+
+Payment Terms: Net 30
+
+Regards,
+Summit Manufacturing Co. Accounts

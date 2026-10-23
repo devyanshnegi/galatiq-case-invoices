@@ -53,6 +53,13 @@ class Settings:
     log_dir: Path = PROJECT_ROOT / "logs"
     max_extraction_attempts: int = 3  # initial extraction + up to 2 self-corrections
     max_review_rounds: int = 3  # initial decision + up to 2 critique-driven revisions
+    # Skip LLM deliberation when the policy leaves exactly one possible outcome (clean -> approve,
+    # blocking error -> reject). Deliberation is spent only where there's discretion.
+    fast_path: bool = True
+    workers: int = 4  # concurrent invoices in batch / queue mode
+    tools_backend: str = "local"  # local | mcp  (ERP + bank tools in-process, or via MCP servers)
+    secondary_llm: LLMSettings | None = None  # optional second-opinion model for hard extractions
+    bank_single_payment_limit: float = 50_000.0  # enforced by the bank (MCP server), not by the agents
 
 
 def load_settings(**overrides) -> Settings:
@@ -73,5 +80,20 @@ def load_settings(**overrides) -> Settings:
         cfo_threshold=float(_env("CFO_THRESHOLD", "50000")),
         price_variance_tolerance=float(_env("PRICE_VARIANCE_TOLERANCE", "0.10")),
     )
+    secondary = None
+    if _env("LLM_SECONDARY_PROVIDER"):
+        secondary = LLMSettings(
+            provider=_env("LLM_SECONDARY_PROVIDER").lower(), model=_env("LLM_SECONDARY_MODEL"),
+            ollama_base_url=llm.ollama_base_url, xai_api_key=llm.xai_api_key, openai_api_key=llm.openai_api_key,
+            anthropic_api_key=llm.anthropic_api_key, timeout_s=llm.timeout_s, fallback_to_offline=False,
+        )
     db_path = overrides.pop("db_path", None) or Path(_env("INVENTORY_DB", str(PROJECT_ROOT / "inventory.db")))
-    return Settings(llm=llm, policy=policy, db_path=Path(db_path), **overrides)
+    defaults = {
+        "fast_path": _env("FAST_PATH", "true").lower() == "true",
+        "workers": int(_env("WORKERS", "4")),
+        "tools_backend": _env("TOOLS_BACKEND", "local").lower(),
+        "secondary_llm": secondary,
+        "bank_single_payment_limit": float(_env("BANK_SINGLE_PAYMENT_LIMIT", "50000")),
+    }
+    defaults.update({k: v for k, v in overrides.items() if v is not None})
+    return Settings(llm=llm, policy=policy, db_path=Path(db_path), **defaults)

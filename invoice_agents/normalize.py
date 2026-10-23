@@ -25,7 +25,8 @@ def parse_money(value) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
     text = fix_ocr_digits(str(value)).strip()
-    negative = text.startswith("(") and text.endswith(")") or text.startswith("-")
+    # '-$250', '$-250', '(250)' are all negative
+    negative = (text.startswith("(") and text.endswith(")")) or bool(re.match(r"^[A-Z$€£\s]*-", text))
     digits = re.sub(r"[^\d.]", "", text)
     if not digits or digits == ".":
         return None

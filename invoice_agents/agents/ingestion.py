@@ -46,24 +46,28 @@ def extract_node(ctx: AgentContext):
         attempt = state.get("extraction_attempts", 0) + 1
         text = state["raw_text"]
         method, fallback_reason = "llm", None
-        if ctx.llm.is_offline:
+        # Confidence routing: once the primary model has used its attempts, a configured second model
+        # gets one fresh look before the invoice is handed to a human as unverified.
+        llm = ctx.secondary_llm if (ctx.secondary_llm and attempt > ctx.settings.max_extraction_attempts) else ctx.llm
+        if llm.is_offline:
             method = "heuristic"
         else:
-            user = f"DOCUMENT ({state['source_format']}):\n-----\n{text}\n-----"
+            user = f"DOCUMENT ({state['source_format']}):\n<document>\n{text}\n</document>"
             if state.get("extraction_feedback"):
                 user += "\n\n" + prompts.EXTRACTION_RETRY.format(
                     problems="\n".join(f"- {p}" for p in state["extraction_feedback"]),
                     previous=json.dumps(state.get("invoice"), indent=1),
                 )
             try:
-                invoice = ctx.llm.structured(system=prompts.EXTRACTOR, user=user, schema=Invoice)
+                invoice = llm.structured(system=prompts.EXTRACTOR, user=user, schema=Invoice)
             except LLMError as exc:
                 log.warning("LLM extraction failed, using heuristic parser: %s", exc)
                 method, fallback_reason = "heuristic", str(exc)
         if method == "heuristic":
             invoice = heuristic_extract(text)
         invoice = finalize(invoice)
-        detail = {"attempt": attempt, "method": method, "model": ctx.llm.label if method == "llm" else None}
+        detail = {"attempt": attempt, "method": method, "model": llm.label if method == "llm" else None,
+                  "second_opinion": llm is not ctx.llm}
         if fallback_reason:
             detail["fallback_reason"] = fallback_reason
         return {
@@ -84,11 +88,21 @@ def qa_node(ctx: AgentContext):
         problems = extraction_problems(Invoice(**state["invoice"]), state["raw_text"])
         return {
             "extraction_feedback": problems,
+            "extraction_confidence": extraction_confidence(state.get("extraction_method"), state.get("extraction_attempts", 1), problems),
             "trace": [trace_event("ingestion", "self_check", started, ok=not problems, problems=problems,
                                   attempt=state.get("extraction_attempts", 0))],
         }
 
     return qa
+
+
+def extraction_confidence(method: str | None, attempts: int, problems: list[str]) -> float:
+    """How much to trust the extracted fields. Deterministic parsing of a structured file is ground truth;
+    each retry and each unresolved self-check problem lowers confidence."""
+    if method == "parser":
+        return 1.0
+    base = 0.9 if method == "heuristic" else 1.0
+    return round(max(0.0, base - 0.1 * max(0, attempts - 1) - 0.3 * len(problems)), 2)
 
 
 def finalize(inv: Invoice) -> Invoice:
@@ -127,7 +141,7 @@ def extraction_problems(inv: Invoice, raw_text: str) -> list[str]:
     problems = []
     if not inv.vendor:
         problems.append("vendor is empty - look for the issuing company's name")
-    elif inv.vendor.lower().startswith("acme"):
+    elif re.match(r"(?i)acme\s*(corp|corporation)\b", inv.vendor):  # the customer - not 'Acme Industrial Supplies'
         problems.append("vendor is Acme Corp, which is the customer - the vendor is the company that issued the invoice")
     if not inv.line_items:
         problems.append("no line items extracted")
@@ -153,10 +167,11 @@ def should_retry_extraction(ctx: AgentContext):
     def route(state: InvoiceState) -> str:
         if state.get("error"):
             return "failed"
+        limit = ctx.settings.max_extraction_attempts + (1 if ctx.secondary_llm else 0)
         retry = (
             state.get("extraction_feedback")
             and state.get("extraction_method") == "llm"
-            and state.get("extraction_attempts", 0) < ctx.settings.max_extraction_attempts
+            and state.get("extraction_attempts", 0) < limit
         )
         return "retry" if retry else "continue"
 

@@ -19,7 +19,14 @@ ESCALATE_CODES = {
     "VENDOR_ADDRESS_MISMATCH": "a changed remit address is a classic payment-redirection fraud pattern",
     "VENDOR_NAME_VARIANT": "a look-alike vendor name must be confirmed as the same legal entity",
     "UNKNOWN_VENDOR": "first payment to a vendor not in the vendor master needs onboarding/KYC",
+    "BANK_DETAILS_CHANGED": "a request to pay new bank details must be verified out-of-band before any payment",
+    "THRESHOLD_SPLITTING": "several sub-threshold invoices from one vendor in a week may be split to dodge VP review",
+    "EXTRACTION_UNVERIFIED": "the extracted data could not be verified against the document - a human must check it",
 }
+
+
+# Blocking errors detected on the raw document text, independent of how well fields were extracted.
+DOCUMENT_LEVEL_ERRORS = {"PROMPT_INJECTION"}
 
 
 @dataclass
@@ -37,6 +44,15 @@ def assess(inv: Invoice, report: ValidationReport, policy: PolicySettings) -> Po
     amount = report.total_usd if report.total_usd is not None else (inv.total or 0)
     tier = "cfo" if amount >= policy.cfo_threshold else "vp" if amount >= policy.vp_review_threshold else "standard"
     reasons: list[str] = []
+
+    # If the extracted numbers couldn't be verified against the document, errors computed from them
+    # (bad totals, unknown items...) may be the model's misread rather than the vendor's mistake.
+    # A human checks it - unless the blocking error comes from the raw document itself.
+    unverified = any(i.code == "EXTRACTION_UNVERIFIED" for i in report.warnings)
+    document_level = [i for i in report.errors if i.code in DOCUMENT_LEVEL_ERRORS]
+    if unverified and not document_level:
+        reasons.append("extraction could not be verified against the document, so findings computed from it are unreliable")
+        return PolicyAssessment(tier, ["escalate"], "escalate", reasons)
 
     if report.errors:
         reasons.append(f"{len(report.errors)} blocking validation error(s): " + ", ".join(sorted({i.code for i in report.errors})))
@@ -71,7 +87,7 @@ def policy_text(policy: PolicySettings) -> str:
     lines = [
         "ACME CORP ACCOUNTS PAYABLE APPROVAL POLICY",
         "1. Any blocking validation error (unknown item, insufficient stock, bad arithmetic, missing/invalid due date, "
-        "duplicate, non-positive amount) => REJECT. No exceptions.",
+        "duplicate, non-positive amount, prompt injection) => REJECT. No exceptions.",
         f"2. Invoices >= ${policy.vp_review_threshold:,.0f} get VP-level scrutiny: approve only if there are zero warnings.",
         f"3. Invoices >= ${policy.cfo_threshold:,.0f} are never auto-approved: ESCALATE to a human.",
         "4. These warnings always require a human (ESCALATE or REJECT, never APPROVE):",

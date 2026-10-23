@@ -93,3 +93,17 @@ def test_unsupported_file(tmp_path):
     bad.write_text("hi")
     with pytest.raises(ValueError):
         load_document(bad)
+
+
+def test_negative_amount_with_sign_after_currency():
+    assert parse_money("$-1,575.00") == -1575.0 and parse_money("-$20") == -20.0
+
+
+def test_vendor_named_acme_something_is_not_the_customer():
+    from invoice_agents.agents.ingestion import extraction_problems
+    from invoice_agents.models import Invoice, LineItem
+
+    text = "Vendor: Acme Industrial Supplies\nWidgetA qty: 2 unit price: $250.00\nTotal: $500.00"
+    inv = Invoice(vendor="Acme Industrial Supplies", total=500.0, due_date_raw="x", line_items=[LineItem(item="WidgetA", quantity=2, unit_price=250)])
+    assert not any("customer" in p for p in extraction_problems(inv, text))
+    assert any("customer" in p for p in extraction_problems(inv.model_copy(update={"vendor": "Acme Corp"}), text))

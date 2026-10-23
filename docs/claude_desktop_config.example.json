@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "acme-ap": {
+      "command": "C:\\path\\to\\galatiq-invoice-agents\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "invoice_agents.mcp_servers.ap"],
+      "cwd": "C:\\path\\to\\galatiq-invoice-agents",
+      "env": {
+        "LLM_PROVIDER": "ollama",
+        "INVENTORY_DB": "C:\\path\\to\\galatiq-invoice-agents\\inventory.db"
+      }
+    }
+  }
+}

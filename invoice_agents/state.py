@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import operator
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from typing import Annotated, Any, TypedDict
+from typing import TYPE_CHECKING, Annotated, Any, TypedDict
 
 from .config import Settings
 from .db import Store
 from .llm import LLMClient
+
+if TYPE_CHECKING:
+    from .backends import Backend
 
 
 class InvoiceState(TypedDict, total=False):
@@ -33,6 +37,8 @@ class InvoiceState(TypedDict, total=False):
     critiques: Annotated[list[dict], operator.add]
     decision: dict
     # payment / outcome
+    extraction_confidence: float
+    llm_calls: int
     status: str  # paid | rejected | pending_review | failed
     payment: dict
     invoice_id: int
@@ -45,7 +51,12 @@ class AgentContext:
     settings: Settings
     store: Store
     llm: LLMClient
+    backend: "Backend"
+    secondary_llm: LLMClient | None = None  # second opinion for extractions the primary model can't verify
     today: date = field(default_factory=date.today)
+    # Serialises "re-check the ledger, then write to it" across worker threads, so two copies or
+    # versions of one invoice processed at the same moment can't both be treated as the first.
+    ledger_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 def trace_event(stage: str, event: str, started: float | None = None, **detail: Any) -> dict:

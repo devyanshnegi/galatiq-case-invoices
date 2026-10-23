@@ -31,8 +31,9 @@ FRAUD_PATTERNS = {
     r"wire\s+transfer": "requests wire transfer",
     r"avoid\s+penalt": "threatens penalties",
     r"gift\s*card|bitcoin|crypto": "unusual payment method",
-    r"new\s+bank|bank\s+details\s+(have\s+)?changed|updated\s+account": "bank-detail change request",
 }
+BANK_CHANGE_PATTERN = (r"new\s+(bank\s+)?account|bank\s+details\s+(have\s+)?(changed|been\s+updated)|updated\s+(bank|remittance|account)"
+                       r"|remit\s+to\s+(our\s+)?new")
 
 
 def _close(a: float, b: float, tol: float = MONEY_TOLERANCE) -> bool:
@@ -220,7 +221,7 @@ def check_duplicates(inv: Invoice, store: Store) -> list[Issue]:
     for prior in store.find_prior_invoices(inv.invoice_number, inv.vendor):
         same_vendor = normalize_name(prior["vendor"]) == normalize_name(inv.vendor)
         where = f"{Path(prior['source_file'] or 'unknown file').name} on {prior['processed_at'][:10]}"
-        if prior["status"] in {"paid", "pending_review"}:
+        if prior["status"] in {"approved", "paid", "pending_review"}:
             if prior["fingerprint"] == fp:
                 issues.append(Issue(code="DUPLICATE_INVOICE", severity=E, field="invoice_number",
                                     message=f"{inv.invoice_number} was already {prior['status'].replace('_', ' ')} ({where}) - duplicate."))
@@ -241,15 +242,63 @@ def check_duplicates(inv: Invoice, store: Store) -> list[Issue]:
 
 def check_fraud_signals(inv: Invoice, raw_text: str) -> list[Issue]:
     text = f"{raw_text}\n{inv.notes or ''}\n{inv.payment_terms or ''}"
+    issues = []
+    # Payment-redirection is the most expensive AP fraud, so it gets its own code that always needs a human.
+    change = re.search(BANK_CHANGE_PATTERN, text, re.I)
+    if change:
+        issues.append(Issue(code="BANK_DETAILS_CHANGED", severity=W, field="notes",
+                            message=f"Invoice asks to pay different bank details ('{change.group(0)}') - verify by phone with a known contact."))
     hits = [label for pattern, label in FRAUD_PATTERNS.items() if re.search(pattern, text, re.I)]
+    if hits:
+        issues.append(Issue(code="FRAUD_SIGNALS", severity=W, field="notes", message="Social-engineering red flags: " + "; ".join(hits) + "."))
+    return issues
+
+
+# Text that tries to instruct the AP system rather than bill it. Legitimate invoices never address
+# "the AI"; one that does is treated as an attack, not an invoice.
+INJECTION_PATTERNS = [
+    r"ignore\s+(all\s+|any\s+)?(previous|prior|above|earlier)\s+(instructions|rules|prompts?)",
+    r"\b(ai|a\.i\.|llm|language model|assistant|agent|chatbot|gpt|claude|grok)\b[^.\n]{0,60}\b(approve|pay|must|should|instruct)",
+    r"system\s+prompt",
+    r"you\s+are\s+now\b",
+    r"do\s+not\s+(flag|escalate|reject|review|verify|validate)",
+    r"(override|bypass|skip)\s+(the\s+)?(policy|rules|checks|validation|approval)",
+]
+
+
+def check_prompt_injection(raw_text: str) -> list[Issue]:
+    hits = [m.group(0) for p in INJECTION_PATTERNS if (m := re.search(p, raw_text, re.I))]
     if not hits:
         return []
-    return [Issue(code="FRAUD_SIGNALS", severity=W, field="notes", message="Social-engineering red flags: " + "; ".join(hits) + ".")]
+    return [Issue(code="PROMPT_INJECTION", severity=E, field="notes",
+                  message=f"Document contains instructions aimed at the AP system (e.g. '{hits[0][:80]}') - treated as an attack.")]
+
+
+SPLIT_WINDOW_DAYS = 3
+SPLIT_MIN_SHARE = 0.5  # only near-threshold invoices count: vendors legitimately send many small ones
+
+
+def check_threshold_splitting(inv: Invoice, store: Store, policy: PolicySettings) -> list[Issue]:
+    """Same vendor billing several sub-threshold invoices in one week that together cross the VP threshold."""
+    usd = to_usd(inv.total, inv.currency)
+    floor = SPLIT_MIN_SHARE * policy.vp_review_threshold
+    if not usd or not floor <= usd < policy.vp_review_threshold or not inv.invoice_date:
+        return []
+    recent = [r for r in store.recent_vendor_invoices(inv.vendor, inv.invoice_date, SPLIT_WINDOW_DAYS)
+              if r["invoice_number"] != inv.invoice_number and floor <= (r["total"] or 0) < policy.vp_review_threshold]
+    combined = usd + sum(r["total"] or 0 for r in recent)
+    if not recent or combined < policy.vp_review_threshold:
+        return []
+    others = ", ".join(f"{r['invoice_number']} (${r['total']:,.2f})" for r in recent[:4])
+    return [Issue(code="THRESHOLD_SPLITTING", severity=W, field="total",
+                  message=f"{inv.vendor} billed {len(recent) + 1} invoices within {SPLIT_WINDOW_DAYS} days totalling ${combined:,.2f}, "
+                          f"each under the ${policy.vp_review_threshold:,.0f} VP threshold ({others}) - possible split to avoid review.")]
 
 
 # ---- orchestration --------------------------------------------------------------------------
 
-CHECKS = ["required_fields", "line_items_and_stock", "arithmetic", "dates", "vendor", "currency", "duplicates", "fraud_signals"]
+CHECKS = ["required_fields", "line_items_and_stock", "arithmetic", "dates", "vendor", "currency", "duplicates", "fraud_signals",
+          "prompt_injection", "threshold_splitting"]
 
 
 def run_all_checks(inv: Invoice, raw_text: str, store: Store, policy: PolicySettings, today: date | None = None) -> ValidationReport:
@@ -262,6 +311,8 @@ def run_all_checks(inv: Invoice, raw_text: str, store: Store, policy: PolicySett
         *check_currency(inv, policy),
         *check_duplicates(inv, store),
         *check_fraud_signals(inv, raw_text),
+        *check_prompt_injection(raw_text),
+        *check_threshold_splitting(inv, store, policy),
     ]
     rank = {E: 0, W: 1, I: 2}
     issues.sort(key=lambda i: rank[i.severity])  # stable: keeps check order within a severity

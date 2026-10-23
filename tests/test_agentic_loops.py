@@ -79,6 +79,7 @@ def test_reflection_loop_revises_after_critique(settings):
 
 
 def test_guardrail_overrides_an_llm_that_insists_on_paying_a_blocked_invoice(settings):
+    settings = replace(settings, fast_path=False)  # force full deliberation
     """INV-1002 requests 20 GadgetX with 5 in stock. Even if every LLM says approve, it must not be paid."""
     bad = {"invoice_number": "INV-1002", "vendor": "Gadgets Co.", "invoice_date": "2026-01-30", "due_date": "2026-01-30",
            "line_items": [{"item": "GadgetX", "quantity": 20, "unit_price": 750}], "total": 15000, "payment_terms": "Net 30"}
@@ -90,6 +91,7 @@ def test_guardrail_overrides_an_llm_that_insists_on_paying_a_blocked_invoice(set
 
 
 def test_unresolved_disagreement_goes_to_a_human(settings):
+    settings = replace(settings, fast_path=False)  # force full deliberation
     llm = FakeLLM({"Invoice": [GOOD_1001], "RiskAssessment": [NOT_SUSPICIOUS], "ApprovalDecision": [approve()],
                    "Critique": [{"agrees": False, "problems": ["vendor history unclear"], "recommended_decision": "escalate"}]})
     state = run(settings, llm, "invoice_1001.txt")
@@ -107,6 +109,7 @@ def test_risk_analyst_signals_become_warnings(settings):
 
 
 def test_reviewer_uses_tools(settings):
+    settings = replace(settings, fast_path=False)  # force full deliberation
     steps = [ToolStep(tool_calls=[ToolCall("1", "lookup_inventory", {"item": "WidgetA"}), ToolCall("2", "get_vendor_profile", {"vendor": "Widgets Inc."})]),
              ToolStep(text="Stock fine, vendor approved.")]
     llm = FakeLLM({"Invoice": [GOOD_1001], "RiskAssessment": [NOT_SUSPICIOUS], "ApprovalDecision": [approve()], "Critique": [AGREE]}, tool_steps=steps)
@@ -118,6 +121,7 @@ def test_reviewer_uses_tools(settings):
 
 
 def test_llm_outage_falls_back_to_rules(settings):
+    settings = replace(settings, fast_path=False)  # force full deliberation
     class DownLLM(FakeLLM):
         def _complete_json(self, *a, **k):
             raise ConnectionError("connection refused")
@@ -171,6 +175,7 @@ def test_factory_builds_each_provider_without_network():
 
 
 def test_small_model_cannot_reject_a_clean_invoice_over_an_info_note(settings):
+    settings = replace(settings, fast_path=False)  # force full deliberation
     """qwen2.5:7b rejected INV-1001 calling PAST_DUE 'a blocking validation error'. The policy and critic must catch it."""
     bad_reason = {"decision": "reject", "reasoning": "The invoice is past due by 263 days, which is a blocking validation error.",
                   "key_factors": [], "conditions": []}
@@ -185,6 +190,7 @@ def test_small_model_cannot_reject_a_clean_invoice_over_an_info_note(settings):
 
 
 def test_case_file_hides_info_notes_from_the_reviewer(settings):
+    settings = replace(settings, fast_path=False)  # force full deliberation
     llm = FakeLLM({"Invoice": [GOOD_1001], "RiskAssessment": [NOT_SUSPICIOUS], "ApprovalDecision": [approve()], "Critique": [AGREE]})
     state = run(settings, llm, "invoice_1001.txt")
     prompt = llm.prompts["ApprovalDecision"][0]
@@ -213,3 +219,31 @@ def test_finalize_recovers_due_date_and_vendor_aside():
                            invoice_number="INV 1012"))
     assert (inv.vendor, inv.due_date, inv.invoice_number) == ("QuickShip Distributers", "2026-01-30", "INV-1012")
     assert "formerly FastShip Ltd." in inv.notes
+
+
+# ---- fast path ----------------------------------------------------------------------------------
+
+
+def test_fast_path_skips_deliberation_for_clean_invoices(settings):
+    llm = FakeLLM({"Invoice": [GOOD_1001], "RiskAssessment": [NOT_SUSPICIOUS]})  # no reviewer/critic scripted
+    state = run(settings, llm, "invoice_1001.txt")
+    assert state["status"] == "paid" and state["draft_decision"]["method"] == "policy"
+    assert "ApprovalDecision" not in llm.prompts and "Critique" not in llm.prompts
+    assert llm.usage.calls == 2  # extract + risk review
+
+
+def test_fast_path_skips_risk_review_when_already_blocked(settings):
+    bad = {"invoice_number": "INV-1002", "vendor": "Gadgets Co.", "invoice_date": "2026-01-30", "due_date": "2026-01-30",
+           "line_items": [{"item": "GadgetX", "quantity": 20, "unit_price": 750}], "total": 15000, "payment_terms": "Net 30"}
+    llm = FakeLLM({"Invoice": [bad]})
+    state = run(settings, llm, "invoice_1002.txt")
+    assert state["status"] == "rejected" and llm.usage.calls == 1
+
+
+def test_discretionary_invoices_still_get_full_deliberation(settings):
+    llm = FakeLLM({"Invoice": [GOOD_1001], "RiskAssessment": [{"suspicious": True, "signals": [
+        {"category": "payment_redirection", "evidence": "Pay to new account", "severity": "high"}]}],
+        "ApprovalDecision": [{"decision": "escalate", "reasoning": "Bank change.", "key_factors": [], "conditions": ["verify"]}],
+        "Critique": [{**AGREE, "recommended_decision": "escalate"}]})
+    state = run(settings, llm, "invoice_1001.txt")
+    assert state["draft_decision"]["method"] == "llm" and state["critiques"]

@@ -3,6 +3,9 @@
     python main.py --invoice_path=data/invoices/invoice_1001.txt
     python main.py --all                       # every file in data/invoices, with a summary
     python main.py --all --provider=offline    # no LLM needed
+    python main.py --all --workers 8           # concurrent batch
+    python main.py --queue inbox/              # durable job queue: retries, crash recovery
+    python main.py --watch inbox/              # process files as they land
     python main.py --pending                   # human review queue
     python main.py --approve 7 --note "PO amendment confirmed"
 """
@@ -13,6 +16,7 @@ import argparse
 import json
 import logging
 import sys
+import time
 from pathlib import Path
 
 from rich.console import Console
@@ -24,6 +28,7 @@ from invoice_agents.agents.payment import resolve_pending
 from invoice_agents.config import PROJECT_ROOT, load_settings
 from invoice_agents.db import Store
 from invoice_agents.graph import NODE_LABELS, InvoicePipeline
+from invoice_agents.jobqueue import JobQueue
 
 console = Console()
 STATUS_STYLE = {"paid": "green", "rejected": "red", "pending_review": "yellow", "failed": "magenta"}
@@ -160,12 +165,39 @@ def show_pending(store: Store) -> None:
     console.print("Resolve with: [bold]python main.py --approve ID[/] or [bold]--reject ID[/] (optionally --note \"...\")")
 
 
+def compact_line(path: Path, state: dict) -> str:
+    inv = state.get("invoice") or {}
+    status = state.get("status", "failed")
+    issues = [i for i in (state.get("validation") or {}).get("issues", []) if i["severity"] in ("error", "warning")]
+    why = issues[0]["code"] if issues else ("all checks passed" if status != "failed" else (state.get("error") or "")[:60])
+    return (f"  [{STATUS_STYLE.get(status, 'white')}]{status.replace('_', ' '):<15}[/] {path.name:<34} "
+            f"{money(inv.get('total'), inv.get('currency', 'USD')):>14}  [dim]{state.get('llm_calls', 0)} LLM · {why}[/]")
+
+
+def render_throughput(states: list[dict], seconds: float, workers: int) -> None:
+    n = len(states)
+    if not n or seconds <= 0:
+        return
+    durations = sorted(sum(e.get("ms") or 0 for e in s.get("trace", [])) for s in states)
+    calls = [s.get("llm_calls", 0) for s in states]
+
+    def pct(q: float) -> float:
+        return durations[min(n - 1, int(q * n))] / 1000
+
+    console.print(f"[bold]{n} invoices in {seconds:.1f}s with {workers} worker(s) = {60 * n / seconds:,.0f}/min[/] · "
+                  f"agent time p50 {pct(0.5):.2f}s, p95 {pct(0.95):.2f}s · {sum(calls) / n:.1f} LLM calls/invoice "
+                  f"({sum(1 for c in calls if c == 0)} needed none)")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Acme Corp multi-agent invoice processing")
     target = parser.add_mutually_exclusive_group()
     target.add_argument("--invoice_path", "--invoice-path", type=Path, help="process a single invoice file")
     target.add_argument("--all", nargs="?", const=PROJECT_ROOT / "data" / "invoices", type=Path, metavar="DIR",
                         help="process every invoice in DIR (default: data/invoices)")
+    target.add_argument("--queue", type=Path, metavar="DIR", help="enqueue every invoice in DIR into the durable job queue and drain it")
+    target.add_argument("--watch", type=Path, metavar="DIR", help="watch DIR and process invoices as they arrive (Ctrl+C to stop)")
+    target.add_argument("--queue-status", action="store_true", help="show job queue counts and recent failures")
     target.add_argument("--pending", action="store_true", help="list invoices awaiting human review")
     target.add_argument("--approve", type=int, metavar="ID", help="human-approve a pending invoice and pay it")
     target.add_argument("--reject", type=int, metavar="ID", help="human-reject a pending invoice")
@@ -173,7 +205,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reviewer", default="cli-user", help="name recorded for a human decision")
     parser.add_argument("--provider", help="override LLM_PROVIDER (ollama | xai | openai | anthropic | offline)")
     parser.add_argument("--model", help="override LLM_MODEL")
-    parser.add_argument("--reset", action="store_true", help="clear the ledger (processed invoices/payments) before running")
+    parser.add_argument("--workers", type=int, help="invoices processed concurrently (default: WORKERS or 4; --all defaults to 1)")
+    parser.add_argument("--backend", choices=["local", "mcp"], help="where ERP + bank tools live (default: TOOLS_BACKEND or local)")
+    parser.add_argument("--no-fast-path", action="store_true", help="send every invoice through full LLM deliberation")
+    parser.add_argument("--reset", action="store_true", help="clear the ledger (processed invoices/payments/jobs) before running")
     parser.add_argument("--json", action="store_true", help="print the full final state as JSON")
     parser.add_argument("-q", "--quiet", action="store_true", help="only print the summary")
     parser.add_argument("-v", "--verbose", action="store_true", help="show info-level findings and debug logs")
@@ -181,10 +216,11 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING, format="%(message)s",
                         handlers=[RichHandler(console=console, show_path=False, show_time=False)])
-    for noisy in ("httpx", "httpcore", "openai", "anthropic", "pdfminer"):
+    for noisy in ("httpx", "httpcore", "openai", "anthropic", "pdfminer", "mcp"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    settings = load_settings(provider=args.provider, model=args.model)
+    settings = load_settings(provider=args.provider, model=args.model, workers=args.workers, tools_backend=args.backend,
+                             fast_path=False if args.no_fast_path else None)
     store = Store(settings.db_path)
     store.init()
     if args.reset:
@@ -194,38 +230,94 @@ def main(argv: list[str] | None = None) -> int:
     if args.pending:
         show_pending(store)
         return 0
+    if args.queue_status:
+        queue = JobQueue(store)
+        stats = queue.stats()
+        console.print(f"queued {stats.queued} · running {stats.running} · done {stats.done} · [red]failed {stats.failed}[/]")
+        for job in [j for j in queue.list_jobs() if j["status"] == "failed"][:10]:
+            console.print(f"  [red]{Path(job['path']).name}[/]: {job['error']}")
+        return 0
     if args.approve or args.reject:
         invoice_id = args.approve or args.reject
         try:
-            result = resolve_pending(store, invoice_id, approve=bool(args.approve), reviewer=args.reviewer, note=args.note)
+            with InvoicePipeline(settings, store=store) as pipeline:
+                result = resolve_pending(store, invoice_id, approve=bool(args.approve), reviewer=args.reviewer, note=args.note,
+                                         backend=pipeline.backend)
         except ValueError as exc:
             console.print(f"[red]{exc}[/]")
             return 1
         console.print(f"Invoice {invoice_id}: {'approved' if args.approve else 'rejected'} - {result}")
         return 0
 
-    if not args.invoice_path and not args.all:
+    if not (args.invoice_path or args.all or args.queue or args.watch):
         parser.print_help()
         return 2
 
-    pipeline = InvoicePipeline(settings, store=store)
-    console.print(Panel.fit(f"LLM: [bold]{pipeline.llm.label}[/]" + ("  [yellow](offline rules - set LLM_PROVIDER to use a model)[/]" if pipeline.llm.is_offline else ""),
-                            title="Acme AP Agents", border_style="blue"))
+    with InvoicePipeline(settings, store=store) as pipeline:
+        mode = f"LLM: [bold]{pipeline.llm.label}[/] · tools: [bold]{pipeline.backend.name}[/] · fast path: {'on' if settings.fast_path else 'off'}"
+        if pipeline.llm.is_offline:
+            mode += "  [yellow](offline rules)[/]"
+        console.print(Panel.fit(mode, title="Acme AP Agents", border_style="blue"))
 
-    if args.invoice_path:
-        if not args.invoice_path.exists():
-            console.print(f"[red]File not found: {args.invoice_path}[/]")
-            return 1
-        state = run_one(pipeline, args.invoice_path, args)
-        return 0 if state.get("status") != "failed" else 1
+        if args.invoice_path:
+            if not args.invoice_path.exists():
+                console.print(f"[red]File not found: {args.invoice_path}[/]")
+                return 1
+            state = run_one(pipeline, args.invoice_path, args)
+            return 0 if state.get("status") != "failed" else 1
 
-    files = sorted(p for p in args.all.iterdir() if p.suffix.lower() in INVOICE_SUFFIXES)
-    results = [(p, run_one(pipeline, p, args)) for p in files]
-    console.rule()
-    render_summary(results)
-    console.print(f"[dim]{pipeline.llm.usage.calls} LLM call(s), {pipeline.llm.usage.seconds:.1f}s model time · "
-                  f"audit log: {settings.log_dir / 'runs.jsonl'}[/]")
-    return 0
+        if args.all:
+            files = sorted(p for p in args.all.iterdir() if p.suffix.lower() in INVOICE_SUFFIXES)
+            workers = args.workers or 1  # sequential by default so the detailed per-invoice output stays readable
+            if workers == 1:
+                started = time.perf_counter()
+                results = [(p, run_one(pipeline, p, args)) for p in files]
+                seconds = time.perf_counter() - started
+            else:
+                def show(path: Path, state: dict) -> None:
+                    if not args.quiet:
+                        console.print(compact_line(path, state))
+
+                batch = pipeline.process_many(files, workers, on_done=show)
+                results, seconds = batch.results, batch.seconds
+            console.rule()
+            if len(results) <= 60:
+                render_summary(results)
+            render_throughput([s for _, s in results], seconds, workers)
+            console.print(f"[dim]{pipeline.llm.usage.calls} LLM call(s), {pipeline.llm.usage.seconds:.1f}s model time · "
+                          f"audit log: {settings.log_dir / 'runs.jsonl'}[/]")
+            return 0
+
+        queue = JobQueue(store)
+        recovered = queue.recover(pipeline)
+        if recovered:
+            console.print(f"[yellow]Recovered {recovered} job(s) interrupted by a previous crash.[/]")
+        done: list[dict] = []
+
+        def finished(job: dict, state: dict) -> None:
+            done.append(state)
+            if not args.quiet:
+                console.print(compact_line(Path(job["path"]), state))
+
+        if args.queue:
+            added, skipped = queue.enqueue_dir(args.queue)
+            console.print(f"Queued {added} invoice(s)" + (f", skipped {skipped} already seen (same file content)" if skipped else "")
+                          + f" · {settings.workers} workers")
+            started = time.perf_counter()
+            queue.run_workers(pipeline, settings.workers, on_done=finished)
+            console.rule()
+            render_throughput(done, time.perf_counter() - started, settings.workers)
+            stats = queue.stats()
+            console.print(f"queue: done {stats.done} · failed {stats.failed}")
+            return 0
+
+        console.print(f"Watching [bold]{args.watch}[/] with {settings.workers} workers - drop invoice files in. Ctrl+C to stop.")
+        try:
+            queue.watch(args.watch, pipeline, settings.workers, on_done=finished,
+                        on_enqueue=lambda n: console.print(f"[blue]+{n} new file(s)[/]"))
+        except KeyboardInterrupt:
+            console.print(f"Stopped. Processed {len(done)} invoice(s) this session.")
+        return 0
 
 
 if __name__ == "__main__":

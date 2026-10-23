@@ -55,7 +55,8 @@ class Requirement:
             out.append("a senior approver (" + " or ".join(ROLES[r] for r in self.senior_roles) + ")")
         if self.required_role and self.required_role not in roles:
             out.append(f"approval by the {ROLES.get(self.required_role, self.required_role)}")
-        if not roles & set(self.authority_roles):
+        if not roles & set(self.authority_roles) and set(self.authority_roles) != set(ROLES):
+            # Only worth saying when the amount rules some roles out (e.g. only the CFO can cover $60K).
             out.append("an approver whose limit covers the amount (" + " or ".join(ROLES[r] for r in self.authority_roles) + ")")
         return out
 

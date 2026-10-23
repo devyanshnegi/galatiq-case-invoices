@@ -88,3 +88,34 @@ def policy_text(policy: PolicySettings) -> str:
         "7. When in doubt, ESCALATE - a delayed payment is cheaper than a fraudulent one.",
     ]
     return "\n".join(lines)
+
+
+def known_issue_codes() -> set[str]:
+    """Every finding code some check can emit (read from the source, so it can't drift)."""
+    import re
+    from pathlib import Path
+
+    source = "".join(p.read_text(encoding="utf-8") for p in Path(__file__).parent.rglob("*.py"))
+    return set(re.findall(r'code="([A-Z_]+)"', source))
+
+
+def policy_problems(settings) -> list[str]:
+    """Mistakes in config/ap_policy.yaml that would silently weaken a control. Empty list = fine."""
+    from .review import ROLES
+
+    p, problems, codes = settings.policy, [], known_issue_codes()
+    for name, listed in (("always_escalate", p.always_escalate), ("human_review.two_person_for_codes", p.two_person_codes),
+                         ("human_review.override.not_overridable", p.not_overridable)):
+        for code in sorted(set(listed) - codes):
+            problems.append(f"{name}: '{code}' is not a code any check produces (typo?) - it will never trigger")
+    for role in sorted(set(p.approver_limits) - set(ROLES)):
+        problems.append(f"approval.approver_limits: unknown role '{role}' (known: {', '.join(ROLES)})")
+    for role in sorted({*p.senior_roles, p.override_required_role} - set(ROLES)):
+        problems.append(f"human_review: unknown role '{role}'")
+    if p.vp_review_threshold >= p.cfo_threshold:
+        problems.append("approval: vp_review_threshold should be below cfo_threshold")
+    if settings.bank_dual_approved_limit < settings.bank_single_payment_limit:
+        problems.append("payments: dual_approved_payment_limit is below single_payment_limit")
+    if not any(limit is None or limit >= p.two_person_threshold for limit in p.approver_limits.values()):
+        problems.append("no role's approval limit reaches the two-person threshold - large invoices could never be paid")
+    return problems

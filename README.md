@@ -40,10 +40,11 @@ python -m venv .venv
 .venv\Scripts\activate          # Windows  (macOS/Linux: source .venv/bin/activate)
 pip install -r requirements.txt
 
-python main.py --all                 # process every sample, print a summary
+python main.py doctor                # check the setup
+python main.py batch                 # process every sample, print a summary
 streamlit run app.py                 # dashboard: live agent steps, review queue, operations, ledger
 python -m invoice_agents.loadtest    # 1,000 synthetic invoices, scored against ground truth
-pytest                               # 161 tests
+pytest                               # 181 tests
 ```
 
 No model or API key is needed to try it. If the configured LLM isn't reachable, the agents fall back to deterministic rules and say so. The database (`inventory.db`) is created and seeded automatically on first run. Run `python -m invoice_agents.db --reset` to recreate it.
@@ -217,27 +218,34 @@ The values the agents enforce live in **[config/ap_policy.yaml](config/ap_policy
 
 ## Using it
 
-**CLI**
+**CLI** (`python main.py --help`; every command has `--help`)
 
 ```bash
-python main.py --invoice_path=data/invoices/invoice_1013.json    # one invoice, full detail
-python main.py --all --reset                                      # whole folder, fresh ledger, summary table
-python main.py --all -q --provider ollama                         # summary only, with a local model
-python main.py --all --workers 8                                  # concurrent batch
-python main.py --queue data/invoices --workers 4                  # durable queue: dedupe, retries, crash recovery
-python main.py --watch inbox/                                     # process files as they land (Ctrl+C to stop)
-python main.py --queue-status                                     # queue counts and failures
-python main.py --all --backend mcp                                # ERP + bank tools over MCP
-python main.py --all --no-fast-path                               # full LLM deliberation on every invoice
-python -m invoice_agents.loadtest --n 1000 --workers 8            # synthetic load test with ground truth
-python -m invoice_agents.synthetic --n 500 --out inbox            # just generate invoices
-python main.py --pending                                          # human review queue (with approvals 1 of 2)
-python main.py --approve 14 --reviewer "Dana Lee" --role vp_finance --note "PO amendment confirmed"
-python main.py --hold 14 --note "calling vendor on file number"    # park for investigation
-python main.py --reopen 9 --role cfo --note "stock arrived at Detroit site, GRN-7781"   # reopen a rejection
-python main.py --approve 14 --note "FX rate confirmed by treasury" --reviewer "J. Smith"
-python main.py --invoice_path=... --json                          # machine-readable output
+python main.py doctor                         # is everything set up? model, database, policy, MCP (--deep calls the model)
+python main.py process data/invoices/invoice_1013.json        # one invoice, live agent trace
+python main.py --invoice_path=data/invoices/invoice_1013.json # the brief's form - still works
+python main.py batch                          # every sample, summary table   (--workers 8 for parallel)
+python main.py batch --fresh --dry-run        # what WOULD happen from a clean ledger - nothing written or paid
+python main.py queue run inbox/ --workers 4   # durable queue: dedupe, retries, crash recovery
+python main.py watch inbox/                   # process files as they land (Ctrl+C to stop)
+
+python main.py review                         # walk the review queue: [a]pprove [r]eject [h]old [d]etails [s]kip [q]uit
+python main.py review --rejected              # walk rejected invoices: [o] reopen one that's actually correct
+python main.py pending                        # the queue as a table, with approvals (1 of 2) and what's still needed
+python main.py show 14                        # one invoice: findings, decision, approvals, payment, agent trace
+python main.py approve 14 --note "PO amendment confirmed"     # also: reject | hold | reopen ID --note "..."
+python main.py approve 14 --dry-run           # would this approval pay, or still need a second approver?
+python main.py payments --csv register.csv    # payment register with who authorised each payment
+python main.py policy                         # the policy in force, where each value comes from, any mistakes
 ```
+
+Engine options work on any command that runs the agents: `--provider ollama`, `--model ...`, `--backend mcp`, `--no-fast-path`.
+
+Set your reviewer identity once with `AP_REVIEWER="Dana Lee:vp_finance"` instead of `--as "Dana Lee" --role vp_finance` on every command.
+
+**Dry run** copies the ledger to a temporary file and runs exactly the same logic there, so the findings, decisions and "would pay" totals are real. Afterwards the copy is thrown away: nothing is written and nothing is paid.
+
+The old flag style (`--all`, `--pending`, `--approve 14`, `--reviewer`…) is translated to the new commands automatically.
 
 **Dashboard** (`streamlit run app.py`):
 - **Process**: pick a sample or upload a file, then watch each agent finish. You see the extracted line items with catalog matches, every finding, the decision with reasoning, the reflection-loop rounds and the full trace.
@@ -249,7 +257,8 @@ python main.py --invoice_path=... --json                          # machine-read
 ## Project layout
 
 ```
-main.py                     CLI
+main.py                     CLI entry point
+cli/                        CLI: commands, interactive review, doctor, dry run, rendering
 app.py                      Streamlit dashboard (layout, sidebar, header)
 ui/                         dashboard tabs: process, review queue, rejected, payments, operations, ledger
 invoice_agents/
@@ -267,7 +276,7 @@ invoice_agents/
   review.py                 human review engine: roles, limits, two-person rule, hold, reject, reopen
   db.py                     SQLite (WAL): inventory, vendors, invoices, payments, approvals, jobs, human decisions, audit log
   models.py · prompts.py · config.py · normalize.py · state.py
-tests/                      161 tests, incl. scripted-LLM tests of every agentic loop
+tests/                      181 tests, incl. scripted-LLM tests of every agentic loop
 data/invoices/              the provided samples
 data/adversarial/           prompt injection, bank change, remit change, split invoices, scanned PDF
 data/templates/             invoice_template.json: every field a complete invoice can carry

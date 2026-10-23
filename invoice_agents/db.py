@@ -475,6 +475,10 @@ class Store:
         with self.connect() as conn:
             conn.execute("UPDATE invoices SET llm_calls = ?, duration_ms = ? WHERE id = ?", (llm_calls, duration_ms, invoice_id))
 
+    def audit_for_run(self, run_id: str) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            return [dict(r) for r in conn.execute("SELECT * FROM audit_log WHERE run_id = ? ORDER BY id", (run_id,))]
+
     def list_audit(self, limit: int = 500) -> list[dict[str, Any]]:
         with self.connect() as conn:
             return [dict(r) for r in conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,))]

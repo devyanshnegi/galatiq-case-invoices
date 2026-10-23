@@ -54,6 +54,7 @@ DEFAULT_ALWAYS_ESCALATE = {
     "EXTRACTION_UNVERIFIED": "the extracted data could not be verified against the document - a human must check it",
 }
 DEFAULT_FX = {"USD": 1.0, "EUR": 1.08, "GBP": 1.27, "CAD": 0.73}
+DEFAULT_APPROVER_LIMITS = {"ap_specialist": 10_000.0, "department_approver": 10_000.0, "vp_finance": 50_000.0, "cfo": None}
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,14 @@ class PolicySettings:
     split_min_share: float = 0.5
     always_escalate: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_ALWAYS_ESCALATE))
     precedent_min_approvals: int = 2
+    # Human review (§4.3, §15)
+    approver_limits: dict[str, float | None] = field(default_factory=lambda: dict(DEFAULT_APPROVER_LIMITS))
+    two_person_threshold: float = 50_000.0
+    two_person_codes: tuple[str, ...] = ("BANK_DETAILS_CHANGED", "VENDOR_ADDRESS_MISMATCH")
+    senior_roles: tuple[str, ...] = ("vp_finance", "cfo")
+    override_approvals: int = 2
+    override_required_role: str = "cfo"
+    not_overridable: tuple[str, ...] = ("DUPLICATE_INVOICE", "PROMPT_INJECTION")
     policy_id: str = "FIN-AP-001"
     version: str = "builtin"
 
@@ -88,7 +97,9 @@ class Settings:
     workers: int = 4  # concurrent invoices in batch / queue mode
     tools_backend: str = "local"  # local | mcp  (ERP + bank tools in-process, or via MCP servers)
     secondary_llm: LLMSettings | None = None  # optional second-opinion model for hard extractions
+    policy_file: Path | None = None  # which policy file was loaded (passed on to MCP servers)
     bank_single_payment_limit: float = 50_000.0  # enforced by the bank (MCP server), not by the agents
+    bank_dual_approved_limit: float = 250_000.0  # payments two humans approved may go up to this
 
 
 def load_policy_file(path: Path | None = None) -> dict[str, Any]:
@@ -118,7 +129,8 @@ def _num(env_name: str, data: dict, dotted: str, default: float) -> float:
 
 def load_settings(**overrides) -> Settings:
     """Build settings from the policy file and environment. Keyword overrides (e.g. provider="offline") win."""
-    pf = load_policy_file(overrides.pop("policy_file", None))
+    policy_path = overrides.pop("policy_file", None) or _env("AP_POLICY_FILE") or DEFAULT_POLICY_FILE
+    pf = load_policy_file(policy_path)
     llm = LLMSettings(
         provider=(overrides.pop("provider", None) or _env("LLM_PROVIDER", "ollama")).lower(),
         model=overrides.pop("model", None) or _env("LLM_MODEL"),
@@ -141,6 +153,14 @@ def load_settings(**overrides) -> Settings:
         split_min_share=float(_get(pf, "anti_splitting.min_share_of_vp_threshold", 0.5)),
         always_escalate=dict(_get(pf, "always_escalate", DEFAULT_ALWAYS_ESCALATE)),
         precedent_min_approvals=int(_get(pf, "automation.precedent_min_approvals", 2)),
+        approver_limits={k: (None if v is None else float(v))
+                         for k, v in (_get(pf, "approval.approver_limits", None) or DEFAULT_APPROVER_LIMITS).items()},
+        two_person_threshold=float(_get(pf, "human_review.two_person_approval_at", 50_000)),
+        two_person_codes=tuple(_get(pf, "human_review.two_person_for_codes", ["BANK_DETAILS_CHANGED", "VENDOR_ADDRESS_MISMATCH"])),
+        senior_roles=tuple(_get(pf, "human_review.senior_roles", ["vp_finance", "cfo"])),
+        override_approvals=int(_get(pf, "human_review.override.approvals_required", 2)),
+        override_required_role=str(_get(pf, "human_review.override.required_role", "cfo")),
+        not_overridable=tuple(_get(pf, "human_review.override.not_overridable", ["DUPLICATE_INVOICE", "PROMPT_INJECTION"])),
         policy_id=str(_get(pf, "policy.id", "FIN-AP-001")),
         version=str(_get(pf, "policy.version", "builtin")),
     )
@@ -158,7 +178,9 @@ def load_settings(**overrides) -> Settings:
         "workers": int(_env("WORKERS", "4")),
         "tools_backend": _env("TOOLS_BACKEND", "local").lower(),
         "secondary_llm": secondary,
+        "policy_file": Path(policy_path) if pf else None,
         "bank_single_payment_limit": _num("BANK_SINGLE_PAYMENT_LIMIT", pf, "payments.single_payment_limit", 50_000),
+        "bank_dual_approved_limit": float(_get(pf, "payments.dual_approved_payment_limit", 250_000)),
         "max_extraction_attempts": int(_get(pf, "automation.max_extraction_attempts", 3)),
         "max_review_rounds": int(_get(pf, "automation.max_review_rounds", 3)),
     }

@@ -21,9 +21,11 @@ def build_server(settings: Settings, store: Store) -> MCPServer:
     server = MCPServer("acme-bank", instructions="Mock banking API. Pays approved invoices exactly once, within limits.")
 
     @server.tool(description="Pay an approved invoice. Idempotent per invoice_id; declines amounts over the single-payment limit.")
-    def pay_invoice(invoice_id: int, vendor: str, amount: float, currency: str = "USD", invoice_number: str | None = None) -> str:
+    def pay_invoice(invoice_id: int, vendor: str, amount: float, currency: str = "USD", invoice_number: str | None = None,
+                    dual_approved: bool = False) -> str:
         result = bank.pay(store, invoice_id=invoice_id, invoice_number=invoice_number, vendor=vendor, amount=amount,
-                          currency=currency, single_payment_limit=settings.bank_single_payment_limit, quiet=True)
+                          currency=currency, single_payment_limit=settings.bank_single_payment_limit,
+                          dual_approved_limit=settings.bank_dual_approved_limit, dual_approved=dual_approved, quiet=True)
         return json.dumps(result)
 
     @server.tool(description="Look up the payment made for an invoice, if any.")

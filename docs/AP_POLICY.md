@@ -84,11 +84,34 @@ A warning may be accepted without escalation only if the invoice itself document
 
 ### 4.3 Two-person rule
 
-Invoices ≥ [$50,000], and any payment to changed bank details, need **two different approvers**, one of them VP Finance or CFO. — *Manual (agents escalate; a second sign-off isn't yet enforced in software)*
+Before any money moves, these need **two different people** to approve. — *Agents*
+
+- invoices ≥ [$50,000]
+- invoices with a **bank-detail change** or a **changed remit-to address**
+- any reopened rejection (§15)
+
+The rules:
+1. **Different people.** The same name can't approve twice, even under a different role.
+2. **One approver must be senior** (VP Finance or CFO).
+3. **One approver must have authority for the amount** (§2 limits). The other is a second pair of eyes and may hold a lower limit. A $60,000 invoice can be approved by VP Finance and the CFO, for example, but not by two VPs.
+4. **The approval that completes the count must leave nothing missing.** A department approver can't take the last slot when a senior or CFO sign-off is still needed.
+5. The bank releases up to [$50,000] on automation alone. **Two-person-approved payments may go up to [$250,000]**. Above that, treasury arranges the payment manually.
 
 ### 4.4 Anti-splitting
 
 Invoices may not be split to stay under an approval limit. Two or more invoices from one vendor within [3] days, each at least [50%] of the VP threshold and together at or above it, are held for VP review. — *Agents*
+
+### 4.5 Human review actions
+
+Every escalated invoice is in the **review queue**. Reviewers can do three things: — *Agents (dashboard, CLI, MCP)*
+
+| Action | Effect |
+|---|---|
+| **Approve** | Records an approval. Payment happens automatically once §4.3 is satisfied; until then the invoice shows "1 of 2 approvals". |
+| **Reject** | Final, with a reason. The vendor must send a corrected invoice, or the rejection can be reopened under §15. |
+| **Hold for investigation** | Requires a note saying what is being checked (e.g. a vendor call-back). The invoice stays blocked from payment, and from duplicates, until someone approves or rejects it. |
+
+Each action is recorded with the reviewer's name, role, time and note. It is shown on the invoice and becomes a precedent for that vendor (§14).
 
 ## 5. Purchase orders and matching
 
@@ -169,7 +192,7 @@ Whatever the amount, these are **never** paid automatically. — *Agents*. The l
 
 | Rule | Value | Enforcement |
 |---|---|---|
-| **Single-payment limit** at the bank | [$50,000]: larger amounts are declined by the bank and go back to human review | **Agents (bank-side)** |
+| **Single-payment limit** at the bank | [$50,000] for automated payments. [$250,000] when two people approved (§4.3). Larger amounts are declined and go back to human review. | **Agents (bank-side)** |
 | **One payment per invoice** | Enforced at the bank boundary (idempotent) | **Agents** |
 | Payment timing | Pay on the due date, not on approval; take early-payment discounts when the annualised return beats Acme's cost of capital [8%] (e.g. 2/10 Net 30 ≈ 37% annualised) | Manual (planned) |
 | Payment runs | [Twice weekly]; emergency payments need CFO approval and a written reason | Manual |
@@ -215,7 +238,13 @@ Anyone who suspects fraud must **not contact the requester through the details i
 | Escalation unanswered | Auto-reminder at [2] days, to the next approver level at [4] days |
 | Vendor dispute acknowledged | Within [3] business days |
 | Invoice on hold for missing documents | Vendor notified within [1] business day |
-| **Policy exceptions** | Only the CFO may approve, in writing, for one invoice; logged with the reason |
+| **Policy exceptions** | Only with the CFO's approval, in writing, for one invoice; logged with the reason. See below. |
+
+**Paying a rejected invoice (reopening)** — *Agents*
+- If a reviewer believes a rejected invoice is actually correct (for example, stock arrived at another site), they can **reopen** it with a written justification of at least a sentence.
+- It returns to the review queue marked **Policy exception**.
+- Payment then needs **[2] approvers including the [CFO]**. Approvals given before the reopen don't count.
+- **Never reopenable:** exact duplicates (it would pay twice), prompt-injection attacks, and unreadable documents (process a corrected copy instead).
 
 ## 16. Period end
 
@@ -242,7 +271,12 @@ Anyone who suspects fraud must **not contact the requester through the details i
 |---|---|---|
 | Clean $5,000 invoice from an approved vendor | Paid automatically | 4.1 |
 | Clean $12,500 invoice | Approved after agent VP review and audit critique | 4.1 |
-| $60,000 invoice | Human sign-off; two approvers | 4.1, 4.3 |
+| $60,000 invoice | Two approvers: one senior, one with authority for $60K (CFO); paid once both sign | 4.1, 4.3 |
+| $18,000 invoice with an unexplained price premium | One approver with authority (VP Finance or CFO); an AP specialist is blocked by their limit | 4.1, 2 |
+| Bank-detail change on a $1,500 invoice | Two approvers incl. a senior one, after a call-back | 4.3, 7 |
+| Reviewer needs time to check something | Hold for investigation with a note | 4.5 |
+| Reviewer thinks a rejected invoice is actually fine | Reopen with justification; CFO + one other must approve | 15 |
+| Someone tries to reopen a duplicate | Refused | 15 |
 | Quantity exceeds stock | Rejected | 5 |
 | Item not in catalog | Rejected | 5 |
 | Line amounts don't add up | Rejected | 3 |

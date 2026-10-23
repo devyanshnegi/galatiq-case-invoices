@@ -150,3 +150,19 @@ def test_connections_from_finished_threads_are_closed(store):
         t.join()
     store.list_inventory()
     assert store.open_connections() <= 2
+
+
+def test_write_time_recheck_explains_itself(settings, monkeypatch):
+    """When the race guard changes an outcome, the reasoning and findings must say so - not 'Approving...'."""
+    import invoice_agents.checks as checks
+
+    with quiet(), InvoicePipeline(settings) as pipeline:
+        pipeline.process(DATA / "invoice_1004.json")  # the original is paid
+        # Simulate the race: validation of the revision ran before the original reached the ledger.
+        monkeypatch.setattr(checks, "check_duplicates", lambda inv, store: [])
+        state = pipeline.process(DATA / "invoice_1004_revised.json")
+    assert state["status"] == "pending_review"
+    assert state["decision"]["reasoning"].startswith("Escalated by the ledger re-check")
+    assert "REVISED_INVOICE" in {i["code"] for i in state["validation"]["issues"]}
+    row = pipeline.store.get_invoice(state["invoice_id"])
+    assert row["reasoning"].startswith("Escalated") and "REVISED_INVOICE" in row["result_json"]

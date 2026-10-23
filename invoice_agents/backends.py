@@ -44,7 +44,8 @@ class LocalBackend:
                 for name, desc, params, fn in ERP_TOOLS]
 
     def pay(self, **kwargs) -> dict:
-        return bank_pay(self.store, single_payment_limit=self.settings.bank_single_payment_limit, quiet=self.quiet, **kwargs)
+        return bank_pay(self.store, single_payment_limit=self.settings.bank_single_payment_limit,
+                        dual_approved_limit=self.settings.bank_dual_approved_limit, quiet=self.quiet, **kwargs)
 
     def close(self) -> None:
         pass
@@ -63,7 +64,8 @@ class MCPBackend:
         from mcp import Client, StdioServerParameters
 
         def stdio(module: str):
-            env = {"INVENTORY_DB": str(settings.db_path), "BANK_SINGLE_PAYMENT_LIMIT": str(settings.bank_single_payment_limit)}
+            env = {"INVENTORY_DB": str(settings.db_path), "BANK_SINGLE_PAYMENT_LIMIT": str(settings.bank_single_payment_limit),
+                   "AP_POLICY_FILE": str(settings.policy_file) if settings.policy_file else ""}
             return StdioServerParameters(command=sys.executable, args=["-m", module], env=env)
 
         self._targets = (erp_target or stdio("invoice_agents.mcp_servers.erp"), bank_target or stdio("invoice_agents.mcp_servers.bank"))

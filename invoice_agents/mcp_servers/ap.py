@@ -13,7 +13,7 @@ from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
 
-from ..agents.payment import resolve_pending
+from .. import review
 from ..config import PROJECT_ROOT, Settings, load_settings
 from ..graph import InvoicePipeline
 from ..jobqueue import INVOICE_SUFFIXES, JobQueue
@@ -58,20 +58,52 @@ def build_server(pipeline: InvoicePipeline, allowed_root: Path = PROJECT_ROOT) -
         queue.run_workers(pipeline, max(1, min(workers, 16)), on_done=lambda job, state: outcomes.update([state.get("status")]))
         return json.dumps({"queued": added, "skipped_already_seen": skipped, "outcomes": dict(outcomes)})
 
-    @server.tool(description="List invoices waiting for a human decision, with why each was escalated.")
-    def list_pending() -> str:
-        rows = store.list_invoices("pending_review")
-        return json.dumps([{"invoice_id": r["id"], "invoice_number": r["invoice_number"], "vendor": r["vendor"],
-                            "total": r["total"], "currency": r["currency"], "why": r["reasoning"],
-                            "precedents": store.vendor_precedents(r["vendor"], limit=3)} for r in rows], default=str)
+    settings = pipeline.settings
 
-    @server.tool(description="Approve (and pay) or reject an escalated invoice. Approving moves money: confirm with the user first.")
-    def resolve_invoice(invoice_id: int, approve: bool, reviewer: str, note: str = "") -> str:
+    def case_json(c: review.ReviewCase) -> dict:
+        r = c.row
+        return {"invoice_id": r["id"], "status": r["status"], "invoice_number": r["invoice_number"], "vendor": r["vendor"],
+                "total": r["total"], "currency": r["currency"], "why": r["reasoning"],
+                "approvals": f"{len(c.approvers)} of {c.requirement.approvals}", "still_needed": c.missing(),
+                "precedents": store.vendor_precedents(r["vendor"], limit=3)}
+
+    @server.tool(description="List invoices waiting for a human decision (including on hold), with what each still needs.")
+    def list_pending() -> str:
+        return json.dumps([case_json(c) for c in review.list_cases(store, settings.policy)], default=str)
+
+    @server.tool(description="List rejected invoices with the reason, and whether a human may reopen each one.")
+    def list_rejected() -> str:
+        cases = review.list_cases(store, settings.policy, statuses=("rejected",))
+        return json.dumps([{**case_json(c), "can_reopen": review.why_cannot_reopen(c, settings.policy) is None,
+                            "cannot_reopen_because": review.why_cannot_reopen(c, settings.policy)} for c in cases], default=str)
+
+    @server.tool(description="Approve or reject an escalated invoice. role is one of ap_specialist, department_approver, "
+                             "vp_finance, cfo. Large or risky invoices need two different approvers before payment. "
+                             "Approving can move money: confirm with the user first.")
+    def resolve_invoice(invoice_id: int, approve: bool, reviewer: str, note: str = "", role: str = "vp_finance") -> str:
         try:
-            payment = resolve_pending(store, invoice_id, approve=approve, reviewer=reviewer, note=note, backend=pipeline.backend)
-        except ValueError as exc:
+            if approve:
+                outcome = review.approve(store, invoice_id, reviewer=reviewer, role=role, note=note, backend=pipeline.backend, settings=settings)
+            else:
+                outcome = review.reject(store, invoice_id, reviewer=reviewer, role=role, note=note, settings=settings)
+        except review.ReviewError as exc:
             return json.dumps({"error": str(exc)})
-        return json.dumps({"invoice_id": invoice_id, "decision": "approved" if approve else "rejected", "payment": payment})
+        return json.dumps({"invoice_id": invoice_id, **outcome}, default=str)
+
+    @server.tool(description="Put an invoice awaiting review on hold for investigation. note says what is being checked.")
+    def hold_invoice(invoice_id: int, reviewer: str, note: str, role: str = "vp_finance") -> str:
+        try:
+            return json.dumps({"invoice_id": invoice_id, **review.hold(store, invoice_id, reviewer=reviewer, role=role, note=note, settings=settings)})
+        except review.ReviewError as exc:
+            return json.dumps({"error": str(exc)})
+
+    @server.tool(description="Reopen a REJECTED invoice a human believes is correct (policy exception; needs a written reason). "
+                             "Payment then needs two approvers including the CFO.")
+    def reopen_invoice(invoice_id: int, reviewer: str, reason: str, role: str = "vp_finance") -> str:
+        try:
+            return json.dumps({"invoice_id": invoice_id, **review.reopen(store, invoice_id, reviewer=reviewer, role=role, reason=reason, settings=settings)})
+        except review.ReviewError as exc:
+            return json.dumps({"error": str(exc)})
 
     @server.tool(description="Ledger summary: counts and dollar totals by outcome, straight-through rate, queue state.")
     def ledger_summary() -> str:

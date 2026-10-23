@@ -62,20 +62,21 @@ CREATE TABLE IF NOT EXISTS invoices (
     total REAL,
     currency TEXT,
     fingerprint TEXT,
-    status TEXT NOT NULL,           -- paid | rejected | pending_review | failed
+    status TEXT NOT NULL,           -- approved | paid | rejected | pending_review | on_hold | failed
     decision TEXT,
     reasoning TEXT,
     source_file TEXT,
     result_json TEXT,
     llm_calls INTEGER,
     duration_ms INTEGER,
+    override_reason TEXT,           -- set when a human reopened a rejected invoice (policy exception)
     processed_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 -- Race-safe duplicate protection: with parallel workers, two copies of one invoice can pass the
 -- duplicate *check* at the same moment. The database refuses the second payable record.
 CREATE UNIQUE INDEX IF NOT EXISTS one_payable_record_per_invoice
-    ON invoices(fingerprint) WHERE status IN ('approved', 'paid', 'pending_review') AND fingerprint IS NOT NULL;
+    ON invoices(fingerprint) WHERE status IN ('approved', 'paid', 'pending_review', 'on_hold') AND fingerprint IS NOT NULL;
 CREATE INDEX IF NOT EXISTS invoices_by_number ON invoices(invoice_number);
 CREATE INDEX IF NOT EXISTS invoices_by_run ON invoices(run_id);
 CREATE TABLE IF NOT EXISTS jobs (
@@ -107,6 +108,17 @@ CREATE TABLE IF NOT EXISTS human_decisions (
     decided_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS human_decisions_by_vendor ON human_decisions(vendor_key);
+-- Every human action on an invoice: approve / reject / hold / reopen. Drives the two-person rule.
+CREATE TABLE IF NOT EXISTS approvals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    invoice_id INTEGER NOT NULL REFERENCES invoices(id),
+    reviewer TEXT NOT NULL,
+    role TEXT NOT NULL,
+    action TEXT NOT NULL,           -- approve | reject | hold | reopen
+    note TEXT,
+    decided_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS approvals_by_invoice ON approvals(invoice_id);
 CREATE TABLE IF NOT EXISTS payments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     invoice_id INTEGER REFERENCES invoices(id),
@@ -225,7 +237,7 @@ class Store:
                 Path(f"{self.path}{suffix}").unlink(missing_ok=True)
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode = WAL")  # readers don't block the writer: needed for parallel workers
-            for column in ("llm_calls INTEGER", "duration_ms INTEGER"):  # upgrade databases from v1
+            for column in ("llm_calls INTEGER", "duration_ms INTEGER", "override_reason TEXT"):  # upgrade older databases
                 with suppress(sqlite3.OperationalError):
                     conn.execute(f"ALTER TABLE invoices ADD COLUMN {column}")
             conn.execute("DROP INDEX IF EXISTS one_payable_record_per_invoice")  # recreated below with current definition
@@ -240,7 +252,7 @@ class Store:
         """Clear processed invoices/payments but keep master data."""
         with self.connect() as conn:
             conn.executescript("DELETE FROM payments; DELETE FROM invoices; DELETE FROM audit_log; "
-                               "DELETE FROM jobs; DELETE FROM human_decisions;")
+                               "DELETE FROM jobs; DELETE FROM human_decisions; DELETE FROM approvals;")
 
     # ---- master data ---------------------------------------------------------------------
 
@@ -341,7 +353,7 @@ class Store:
         with self.connect() as conn:
             rows = [dict(r) for r in conn.execute(
                 "SELECT id, invoice_number, vendor, total, status, result_json FROM invoices "
-                "WHERE status IN ('approved', 'paid', 'pending_review')")]
+                "WHERE status IN ('approved', 'paid', 'pending_review', 'on_hold')")]
         out = []
         for r in rows:
             if normalize_name(r["vendor"]) != key:
@@ -368,6 +380,23 @@ class Store:
                 "SELECT vendor, invoice_number, issue_codes, decision, note, reviewer, decided_at FROM human_decisions "
                 "WHERE vendor_key = ? ORDER BY id DESC LIMIT ?", (normalize_name(vendor), limit)).fetchall()
         return [dict(r) | {"issue_codes": json.loads(r["issue_codes"])} for r in rows]
+
+    def add_approval(self, *, invoice_id: int, reviewer: str, role: str, action: str, note: str = "") -> None:
+        with self.connect() as conn:
+            conn.execute("INSERT INTO approvals (invoice_id, reviewer, role, action, note, decided_at) VALUES (?,?,?,?,?,?)",
+                         (invoice_id, reviewer, role, action, note, now_iso()))
+
+    def list_approvals(self, invoice_id: int) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            return [dict(r) for r in conn.execute("SELECT * FROM approvals WHERE invoice_id = ? ORDER BY id", (invoice_id,))]
+
+    def all_approvals(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            return [dict(r) for r in conn.execute("SELECT * FROM approvals ORDER BY id DESC")]
+
+    def set_override(self, invoice_id: int, reason: str | None) -> None:
+        with self.connect() as conn:
+            conn.execute("UPDATE invoices SET override_reason = ?, updated_at = ? WHERE id = ?", (reason, now_iso(), invoice_id))
 
     def update_invoice_status(self, invoice_id: int, status: str, decision: str, reasoning: str) -> None:
         with self.connect() as conn:

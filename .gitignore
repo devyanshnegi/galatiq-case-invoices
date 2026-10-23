@@ -9,3 +9,4 @@ __pycache__/
 logs/
 uploads/
 .claude/
+commit_msg.txt

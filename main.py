@@ -24,14 +24,14 @@ from rich.logging import RichHandler
 from rich.panel import Panel
 from rich.table import Table
 
-from invoice_agents.agents.payment import resolve_pending
+from invoice_agents import review
 from invoice_agents.config import PROJECT_ROOT, load_settings
 from invoice_agents.db import Store
 from invoice_agents.graph import NODE_LABELS, InvoicePipeline
 from invoice_agents.jobqueue import JobQueue
 
 console = Console()
-STATUS_STYLE = {"paid": "green", "rejected": "red", "pending_review": "yellow", "failed": "magenta"}
+STATUS_STYLE = {"paid": "green", "rejected": "red", "pending_review": "yellow", "on_hold": "blue", "failed": "magenta"}
 SEVERITY_STYLE = {"error": "red", "warning": "yellow", "info": "dim"}
 INVOICE_SUFFIXES = {".txt", ".pdf", ".json", ".csv", ".xml"}
 
@@ -153,16 +153,21 @@ def render_summary(results: list[tuple[Path, dict]]) -> None:
     )
 
 
-def show_pending(store: Store) -> None:
-    rows = store.list_invoices("pending_review")
-    if not rows:
+def show_pending(store: Store, settings) -> None:
+    cases = review.list_cases(store, settings.policy)
+    if not cases:
         console.print("[green]No invoices awaiting review.[/]")
         return
-    table = Table("ID", "Invoice", "Vendor", "Total", "Why it needs a human", title="Human review queue", header_style="bold")
-    for r in rows:
-        table.add_row(str(r["id"]), r["invoice_number"] or "-", r["vendor"] or "-", money(r["total"], r["currency"]), r["reasoning"])
+    table = Table("ID", "Status", "Invoice", "Vendor", "Total", "Approvals", "Still needed", "Why it needs a human",
+                  title="Human review queue", header_style="bold")
+    for c in cases:
+        r = c.row
+        table.add_row(str(r["id"]), f"[{STATUS_STYLE[c.status]}]{c.status.replace('_', ' ')}[/]", r["invoice_number"] or "-",
+                      r["vendor"] or "-", money(r["total"], r["currency"]), f"{len(c.approvers)} of {c.requirement.approvals}",
+                      "; ".join(c.missing()) or "-", r["reasoning"])
     console.print(table)
-    console.print("Resolve with: [bold]python main.py --approve ID[/] or [bold]--reject ID[/] (optionally --note \"...\")")
+    console.print("Act with [bold]--approve ID[/], [bold]--reject ID[/], [bold]--hold ID[/] or [bold]--reopen ID[/] "
+                  "plus [bold]--reviewer NAME --role ROLE --note \"...\"[/]. Roles: " + ", ".join(review.ROLES))
 
 
 def compact_line(path: Path, state: dict) -> str:
@@ -201,8 +206,11 @@ def main(argv: list[str] | None = None) -> int:
     target.add_argument("--pending", action="store_true", help="list invoices awaiting human review")
     target.add_argument("--approve", type=int, metavar="ID", help="human-approve a pending invoice and pay it")
     target.add_argument("--reject", type=int, metavar="ID", help="human-reject a pending invoice")
+    target.add_argument("--hold", type=int, metavar="ID", help="put a pending invoice on hold for investigation (needs --note)")
+    target.add_argument("--reopen", type=int, metavar="ID", help="reopen a REJECTED invoice for human review (needs --note justification)")
     parser.add_argument("--note", default="", help="note to attach to a human decision")
     parser.add_argument("--reviewer", default="cli-user", help="name recorded for a human decision")
+    parser.add_argument("--role", default="vp_finance", choices=list(review.ROLES), help="reviewer's role (sets their approval limit)")
     parser.add_argument("--provider", help="override LLM_PROVIDER (ollama | xai | openai | anthropic | offline)")
     parser.add_argument("--model", help="override LLM_MODEL")
     parser.add_argument("--workers", type=int, help="invoices processed concurrently (default: WORKERS or 4; --all defaults to 1)")
@@ -228,7 +236,7 @@ def main(argv: list[str] | None = None) -> int:
         console.print("[dim]Ledger cleared.[/]")
 
     if args.pending:
-        show_pending(store)
+        show_pending(store, settings)
         return 0
     if args.queue_status:
         queue = JobQueue(store)
@@ -237,16 +245,22 @@ def main(argv: list[str] | None = None) -> int:
         for job in [j for j in queue.list_jobs() if j["status"] == "failed"][:10]:
             console.print(f"  [red]{Path(job['path']).name}[/]: {job['error']}")
         return 0
-    if args.approve or args.reject:
-        invoice_id = args.approve or args.reject
+    if args.approve or args.reject or args.hold or args.reopen:
+        who = dict(reviewer=args.reviewer, role=args.role)
         try:
-            with InvoicePipeline(settings, store=store) as pipeline:
-                result = resolve_pending(store, invoice_id, approve=bool(args.approve), reviewer=args.reviewer, note=args.note,
-                                         backend=pipeline.backend)
-        except ValueError as exc:
-            console.print(f"[red]{exc}[/]")
+            if args.approve:
+                with InvoicePipeline(settings, store=store) as pipeline:
+                    outcome = review.approve(store, args.approve, note=args.note, backend=pipeline.backend, settings=settings, **who)
+            elif args.reject:
+                outcome = review.reject(store, args.reject, note=args.note, settings=settings, **who)
+            elif args.hold:
+                outcome = review.hold(store, args.hold, note=args.note, settings=settings, **who)
+            else:
+                outcome = review.reopen(store, args.reopen, reason=args.note, settings=settings, **who)
+        except review.ReviewError as exc:
+            console.print(f"[red]Not allowed:[/] {exc}")
             return 1
-        console.print(f"Invoice {invoice_id}: {'approved' if args.approve else 'rejected'} - {result}")
+        console.print(f"[bold]{outcome['status'].replace('_', ' ')}[/] - {outcome['message']}")
         return 0
 
     if not (args.invoice_path or args.all or args.queue or args.watch):

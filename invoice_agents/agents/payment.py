@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 
@@ -36,14 +35,20 @@ def payment_node(ctx: AgentContext):
                 seen = {i["code"] for i in state["validation"]["issues"]}
                 late = [i for i in [*check_duplicates(inv, ctx.store), *check_threshold_splitting(inv, ctx.store, ctx.settings.policy)]
                         if i.severity != Severity.INFO and i.code not in seen]
+                validation = dict(state["validation"])
                 if late and status != "rejected":
                     blocking = any(i.severity == Severity.ERROR for i in late)
                     status = "rejected" if blocking else "pending_review"
+                    found = "; ".join(i.message for i in late)
+                    # Lead with what changed: a reviewer must not read "Approving..." on an escalated invoice.
                     decision.update(decision="reject" if blocking else "escalate", override="ledger re-check at write time",
-                                    reasoning=f"{decision['reasoning']} [Ledger re-check: " + "; ".join(i.message for i in late) + "]")
+                                    reasoning=f"{'Rejected' if blocking else 'Escalated'} by the ledger re-check at payment time: {found} "
+                                              f"(before that, the agents recommended: {decision['reasoning']})")
+                    validation["issues"] = [*validation["issues"], *[i.model_dump(mode="json") for i in late]]
                     events.append(trace_event("payment", "late_duplicate_check", None, codes=[i.code for i in late], outcome=status))
                 record = dict(run_id=state["run_id"], invoice=inv.model_dump(), fingerprint=fingerprint(inv),
-                              source_file=state["invoice_path"], result={**_summary(state), "decision": decision})
+                              source_file=state["invoice_path"],
+                              result={**_summary(state), "decision": decision, "validation": validation})
                 # Approved invoices are recorded as 'approved' and only become 'paid' once the bank confirms,
                 # so a crash in between leaves an honest ledger and a resumable payment.
                 initial = "approved" if status == "paid" else status
@@ -72,7 +77,8 @@ def payment_node(ctx: AgentContext):
         else:
             payment = {"status": "on_hold", "reason": "awaiting human approval"}
             events.append(trace_event("payment", "queued_for_human_review", started, invoice_id=invoice_id, **payment))
-        return {"status": status, "payment": payment, "invoice_id": invoice_id, "decision": decision, "trace": events}
+        return {"status": status, "payment": payment, "invoice_id": invoice_id, "decision": decision,
+                "validation": record["result"]["validation"], "trace": events}
 
     return pay
 
@@ -91,36 +97,25 @@ def failure_node(ctx: AgentContext):
     return fail
 
 
-def resolve_pending(store: Store, invoice_id: int, approve: bool, reviewer: str, note: str = "", backend=None) -> dict:
-    """Human-in-the-loop: a person approves or rejects an escalated invoice.
+def resolve_pending(store: Store, invoice_id: int, approve: bool, reviewer: str, note: str = "", backend=None,
+                    role: str = "vp_finance", settings=None) -> dict:
+    """Approve or reject an escalated invoice. Kept for the CLI/MCP/tests; the rules live in invoice_agents.review.
 
-    The decision is also remembered as a precedent for this vendor, which the reviewer agent sees
-    (via the get_vendor_precedents tool and its case file) on the vendor's next escalated invoice.
+    Approving records one approval. Payment happens only once the policy's requirement is met
+    (e.g. two different people for large amounts), so the return value is the payment when paid,
+    or {'status': 'awaiting_approval', ...} while another approver is still needed.
     """
+    from .. import review
     from ..backends import LocalBackend
     from ..config import load_settings
 
-    row = store.get_invoice(invoice_id)
-    if row is None or row["status"] != "pending_review":
-        raise ValueError(f"Invoice {invoice_id} is not awaiting review")
-    backend = backend or LocalBackend(load_settings(db_path=store.path), store)
-
-    result = json.loads(row["result_json"])
-    inv = Invoice(**result["invoice"])
-    reasoning = f"{'Approved' if approve else 'Rejected'} by {reviewer}" + (f": {note}" if note else "") + f" (agent said: {row['reasoning']})"
+    settings = settings or load_settings(db_path=store.path)
     if approve:
-        payment = execute_payment(backend, invoice_id, inv)
-        new_status = "paid" if payment["status"] in ("success", "skipped") else "pending_review" if payment["status"] == "declined" else "failed"
-        store.update_invoice_status(invoice_id, new_status, "approve", reasoning if new_status == "paid" else f"{reasoning} - {payment}")
-    else:
-        payment = {"status": "not_paid"}
-        store.update_invoice_status(invoice_id, "rejected", "reject", reasoning)
-    warnings = [i["code"] for i in (result.get("validation") or {}).get("issues", []) if i["severity"] == "warning"]
-    store.remember_human_decision(vendor=inv.vendor, invoice_number=inv.invoice_number, issue_codes=warnings,
-                                  decision="approve" if approve else "reject", note=note, reviewer=reviewer)
-    store.audit(run_id=row["run_id"], invoice_number=inv.invoice_number, stage="human_review",
-                event="approved" if approve else "rejected", detail={"reviewer": reviewer, "note": note, "payment": payment})
-    return payment
+        backend = backend or LocalBackend(settings, store)
+        outcome = review.approve(store, invoice_id, reviewer=reviewer, role=role, note=note, backend=backend, settings=settings)
+        return outcome.get("payment") or {"status": outcome["status"], "message": outcome["message"]}
+    review.reject(store, invoice_id, reviewer=reviewer, role=role, note=note, settings=settings)
+    return {"status": "not_paid"}
 
 
 def _summary(state: InvoiceState) -> dict:

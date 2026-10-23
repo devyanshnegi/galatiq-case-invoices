@@ -226,7 +226,7 @@ def check_duplicates(inv: Invoice, store: Store) -> list[Issue]:
     for prior in store.find_prior_invoices(inv.invoice_number, inv.vendor):
         same_vendor = normalize_name(prior["vendor"]) == normalize_name(inv.vendor)
         where = f"{Path(prior['source_file'] or 'unknown file').name} on {prior['processed_at'][:10]}"
-        if prior["status"] in {"approved", "paid", "pending_review"}:
+        if prior["status"] in {"approved", "paid", "pending_review", "on_hold"}:
             if prior["fingerprint"] == fp:
                 issues.append(Issue(code="DUPLICATE_INVOICE", severity=E, field="invoice_number",
                                     message=f"{inv.invoice_number} was already {prior['status'].replace('_', ' ')} ({where}) - duplicate."))

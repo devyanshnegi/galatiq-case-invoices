@@ -43,7 +43,7 @@ pip install -r requirements.txt
 python main.py --all                 # process every sample, print a summary
 streamlit run app.py                 # dashboard: live agent steps, review queue, operations, ledger
 python -m invoice_agents.loadtest    # 1,000 synthetic invoices, scored against ground truth
-pytest                               # 146 tests
+pytest                               # 161 tests
 ```
 
 No model or API key is needed to try it. If the configured LLM isn't reachable, the agents fall back to deterministic rules and say so. The database (`inventory.db`) is created and seeded automatically on first run. Run `python -m invoice_agents.db --reset` to recreate it.
@@ -121,6 +121,24 @@ The agents' tools live behind a backend interface, so they can run in-process or
 To use `acme-ap` from Claude Desktop, see [`docs/claude_desktop_config.example.json`](docs/claude_desktop_config.example.json). The tests run all three over the real MCP protocol, including one that spawns the actual stdio server processes. The 1,000-invoice load test gives identical results on both backends.
 
 MCP is an integration layer, not a speed-up: each tool call crosses a process boundary. It earns its place by decoupling, not throughput.
+
+## People stay in control
+
+The dashboard is built around the people who own the decisions:
+
+- **Review queue.** Each escalated invoice shows:
+  - why it's there and every finding
+  - earlier human decisions for that vendor
+  - an activity log
+  - the source document
+
+  Reviewers can **approve**, **reject**, or **put it on hold for investigation**.
+- **Two-person rule.** Large invoices (≥ $50K) and bank or remit-address changes need **two different people** before money moves: one senior, and one whose approval limit covers the amount. The button tells you whether your click pays or records "1 of 2". If your approval isn't allowed, it says why: over your limit, already approved by you, or a CFO sign-off still needed.
+- **Rejected tab.** If a person believes a rejected invoice is actually correct, they can **reopen** it with a written justification. Payment then needs two approvers including the CFO. Duplicates and prompt-injection attacks can never be reopened.
+- **Payments tab.** Every payment with **who authorised it** (agents or named people, single or two-person), plus a downloadable payment register.
+- **Roles and limits** come from `config/ap_policy.yaml`: AP specialist $10K, VP Finance $50K, CFO unlimited. You pick your name and role in the sidebar. A real deployment would use SSO.
+
+The same rules apply from the CLI (`--approve/--reject/--hold/--reopen ID --reviewer NAME --role ROLE`) and the `acme-ap` MCP server. All three call one review engine, `invoice_agents/review.py`.
 
 ## Making the system smarter
 
@@ -213,7 +231,10 @@ python main.py --all --backend mcp                                # ERP + bank t
 python main.py --all --no-fast-path                               # full LLM deliberation on every invoice
 python -m invoice_agents.loadtest --n 1000 --workers 8            # synthetic load test with ground truth
 python -m invoice_agents.synthetic --n 500 --out inbox            # just generate invoices
-python main.py --pending                                          # human review queue
+python main.py --pending                                          # human review queue (with approvals 1 of 2)
+python main.py --approve 14 --reviewer "Dana Lee" --role vp_finance --note "PO amendment confirmed"
+python main.py --hold 14 --note "calling vendor on file number"    # park for investigation
+python main.py --reopen 9 --role cfo --note "stock arrived at Detroit site, GRN-7781"   # reopen a rejection
 python main.py --approve 14 --note "FX rate confirmed by treasury" --reviewer "J. Smith"
 python main.py --invoice_path=... --json                          # machine-readable output
 ```
@@ -229,7 +250,8 @@ python main.py --invoice_path=... --json                          # machine-read
 
 ```
 main.py                     CLI
-app.py                      Streamlit dashboard
+app.py                      Streamlit dashboard (layout, sidebar, header)
+ui/                         dashboard tabs: process, review queue, rejected, payments, operations, ledger
 invoice_agents/
   graph.py                  LangGraph workflow + InvoicePipeline (stream, process, process_many)
   agents/                   ingestion · validation · approval (fast path, reviewer, critic, guardrail) · payment
@@ -242,9 +264,10 @@ invoice_agents/
   policy.py                 approval policy: allowed outcomes per invoice
   parsers.py                PDF/TXT/JSON/CSV/XML loaders + offline text extractor
   llm/                      provider-agnostic client: base, OpenAI-compatible (Ollama/xAI/OpenAI), Anthropic
-  db.py                     SQLite (WAL): inventory, vendors, invoices, payments, jobs, human decisions, audit log
+  review.py                 human review engine: roles, limits, two-person rule, hold, reject, reopen
+  db.py                     SQLite (WAL): inventory, vendors, invoices, payments, approvals, jobs, human decisions, audit log
   models.py · prompts.py · config.py · normalize.py · state.py
-tests/                      146 tests, incl. scripted-LLM tests of every agentic loop
+tests/                      161 tests, incl. scripted-LLM tests of every agentic loop
 data/invoices/              the provided samples
 data/adversarial/           prompt injection, bank change, remit change, split invoices, scanned PDF
 data/templates/             invoice_template.json: every field a complete invoice can carry

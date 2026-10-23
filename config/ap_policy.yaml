@@ -24,12 +24,24 @@ currency:
 approval:                                     # §4
   vp_review_threshold: 10000                  # [enforced] at or above: VP-level scrutiny
   cfo_threshold: 50000                        # [enforced] at or above: never auto-approved
-  two_person_approval_at: 50000               # [documented] §4.3 second human approver
-  approver_limits:                            # [documented] §2 human approval authority (USD)
+  approver_limits:                            # [enforced] §2 the most each role may approve (USD); null = unlimited
     ap_specialist: 10000
     department_approver: 10000
     vp_finance: 50000
-    cfo: null                                 # unlimited
+    cfo: null
+
+human_review:                                 # §4.3, §15 [enforced]
+  two_person_approval_at: 50000               # at or above: two different people must approve before payment
+  two_person_for_codes:                       # these findings need two approvers whatever the amount
+    - BANK_DETAILS_CHANGED
+    - VENDOR_ADDRESS_MISMATCH
+  senior_roles: [vp_finance, cfo]             # a two-person approval must include one of these
+  override:                                   # reopening a REJECTED invoice is a policy exception
+    approvals_required: 2
+    required_role: cfo                        # one of the approvers must be the CFO
+    not_overridable:                          # never payable, even by humans
+      - DUPLICATE_INVOICE
+      - PROMPT_INJECTION
 
 anti_splitting:                               # [enforced] §4.4
   window_days: 3
@@ -68,6 +80,7 @@ always_escalate:
 
 payments:                                     # §12
   single_payment_limit: 50000                 # [enforced] declined at the bank boundary above this
+  dual_approved_payment_limit: 250000         # [enforced] payments approved by two people may go up to this
   default_method: ACH                         # [documented]
   wire_allowed_above: 100000                  # [documented]
   forbidden_methods: [gift_card, crypto, personal_account]   # [documented] flagged by fraud checks today

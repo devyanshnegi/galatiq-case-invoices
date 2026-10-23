@@ -19,11 +19,15 @@ def mock_payment(vendor, amount):
 
 
 def pay(store: Store, *, invoice_id: int, invoice_number: str | None, vendor: str, amount: float, currency: str,
-        single_payment_limit: float, quiet: bool = False) -> dict:
+        single_payment_limit: float, dual_approved_limit: float | None = None, dual_approved: bool = False,
+        quiet: bool = False) -> dict:
     if not vendor or amount is None or amount <= 0:
         return {"status": "declined", "reason": "missing payee or non-positive amount"}
-    if amount > single_payment_limit:
-        return {"status": "declined", "reason": f"{amount:,.2f} exceeds the bank's single-payment limit of {single_payment_limit:,.2f}"}
+    # Payments two humans signed off may go higher than what automation alone can release.
+    limit = (dual_approved_limit or single_payment_limit) if dual_approved else single_payment_limit
+    if amount > limit:
+        kind = "dual-approved" if dual_approved else "single-payment"
+        return {"status": "declined", "reason": f"{amount:,.2f} exceeds the bank's {kind} limit of {limit:,.2f}"}
 
     reference = f"PAY-{uuid.uuid4().hex[:10].upper()}"
     # Claim first, then move money: two workers (or a double click) can't both get past this line.

@@ -38,12 +38,13 @@ def validate_node(ctx: AgentContext):
             report.risk_score = min(100, report.risk_score + 10 * sum(1 for i in new_issues if i.severity == Severity.WARNING))
 
         assessment = assess(inv, report, ctx.settings.policy)
-        events.append(trace_event("validation", "policy_assessed", None, **assessment.as_dict()))
+        events.append(trace_event("validation", "policy_assessed", None, policy_version=ctx.settings.policy.version,
+                                  **assessment.as_dict()))
         return {
             "invoice": inv.model_dump(),  # now carries matched SKUs
             "validation": report.model_dump(mode="json"),
             "risk": risk.model_dump() if risk else {"skipped": True},
-            "policy": assessment.as_dict(),
+            "policy": {**assessment.as_dict(), "version": ctx.settings.policy.version},
             "trace": events,
         }
 

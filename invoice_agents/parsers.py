@@ -66,19 +66,26 @@ def _pdf_text(path: Path) -> str:
 # ---- structured formats -------------------------------------------------------------------
 
 
+def _json_line(li: dict) -> LineItem:
+    quantity = parse_quantity(li.get("quantity", li.get("qty")))
+    unit_price = parse_money(li.get("unit_price", li.get("price")))
+    discount = parse_money(li.get("discount_amount"))
+    if not discount and li.get("discount_percent") and quantity is not None and unit_price is not None:
+        discount = round(quantity * unit_price * float(li["discount_percent"]), 2)
+    return LineItem(
+        item=str(li.get("item") or li.get("buyer_part_number") or li.get("name") or li.get("description") or ""),
+        quantity=quantity,
+        unit_price=unit_price,
+        amount=parse_money(li.get("amount", li.get("line_total"))),
+        discount=discount or None,
+        note=li.get("note"),
+    )
+
+
 def _from_json(data: dict) -> Invoice:
     vendor = data.get("vendor")
     vendor_name, vendor_address = (vendor.get("name"), vendor.get("address")) if isinstance(vendor, dict) else (vendor, None)
-    items = [
-        LineItem(
-            item=str(li.get("item") or li.get("name") or li.get("description") or ""),
-            quantity=parse_quantity(li.get("quantity", li.get("qty"))),
-            unit_price=parse_money(li.get("unit_price", li.get("price"))),
-            amount=parse_money(li.get("amount", li.get("line_total"))),
-            note=li.get("note"),
-        )
-        for li in data.get("line_items") or data.get("items") or []
-    ]
+    items = [_json_line(li) for li in data.get("line_items") or data.get("items") or []]
     return Invoice(
         invoice_number=data.get("invoice_number"),
         vendor=vendor_name or None,

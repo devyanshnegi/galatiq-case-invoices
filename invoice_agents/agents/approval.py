@@ -71,7 +71,8 @@ def review_node(ctx: AgentContext):
         method = "llm" if decision else "rules"
         if decision is None:
             inv = Invoice(**state["invoice"])
-            decision = rule_based_decision(inv, ValidationReport(**state["validation"]), state["policy"], ctx.store.vendor_precedents(inv.vendor))
+            decision = rule_based_decision(inv, ValidationReport(**state["validation"]), state["policy"], ctx.store.vendor_precedents(inv.vendor),
+                                           ctx.settings.policy.precedent_min_approvals)
         events.append(trace_event("approval", "draft_decision", started, round=round_no, method=method, **decision.model_dump()))
         return {"review_round": round_no, "draft_decision": {**decision.model_dump(), "method": method}, "trace": events}
 
@@ -96,7 +97,8 @@ def _llm_review(ctx: AgentContext, state: InvoiceState, critiques: list[dict]):
     return decision, investigation.calls
 
 
-def rule_based_decision(inv: Invoice, report: ValidationReport, policy: dict, precedents: list[dict] | None = None) -> ApprovalDecision:
+def rule_based_decision(inv: Invoice, report: ValidationReport, policy: dict, precedents: list[dict] | None = None,
+                        min_precedents: int = 2) -> ApprovalDecision:
     """Deterministic reviewer used offline or when the LLM is unavailable."""
     decision = policy["recommended"]
     factors = [f"{i.code}: {i.message}" for i in report.errors + report.warnings]
@@ -115,7 +117,7 @@ def rule_based_decision(inv: Invoice, report: ValidationReport, policy: dict, pr
     warning_codes = sorted({w.code for w in report.warnings})
     same = [p for p in precedents or [] if p["issue_codes"] == warning_codes]
     if (decision == "escalate" and "approve" in policy["allowed"] and warning_codes
-            and len(same) >= 2 and all(p["decision"] == "approve" for p in same)):
+            and len(same) >= min_precedents and all(p["decision"] == "approve" for p in same)):
         decision = "approve"
         conditions.append(f"Approved on precedent: humans approved {len(same)} earlier {inv.vendor} invoices with the same "
                           f"warnings ({', '.join(warning_codes)}), most recently {same[0]['decided_at'][:10]} by {same[0]['reviewer']}.")
@@ -146,7 +148,8 @@ def policy_decision_node(ctx: AgentContext):
     def decide(state: InvoiceState) -> InvoiceState:
         started = time.perf_counter()
         inv = Invoice(**state["invoice"])
-        decision = rule_based_decision(inv, ValidationReport(**state["validation"]), state["policy"], ctx.store.vendor_precedents(inv.vendor))
+        decision = rule_based_decision(inv, ValidationReport(**state["validation"]), state["policy"], ctx.store.vendor_precedents(inv.vendor),
+                                       ctx.settings.policy.precedent_min_approvals)
         return {"review_round": 0, "draft_decision": {**decision.model_dump(), "method": "policy"},
                 "trace": [trace_event("approval", "fast_path_decision", started, decision=decision.decision,
                                       reason=f"policy allows only '{decision.decision}' - no deliberation needed")]}

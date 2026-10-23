@@ -40,7 +40,7 @@ NODE_LABELS = {
     "extract": "Ingestion · extract fields",
     "self_check": "Ingestion · self-check",
     "validate": "Validation · inventory, maths, fraud",
-    "policy_decision": "Approval · fast path (policy-determined)",
+    "policy_decision": "Approval · fast path",
     "review": "Approval · VP review",
     "critique": "Approval · internal-audit critique",
     "guardrail": "Approval · policy guardrail",

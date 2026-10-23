@@ -11,19 +11,7 @@ from dataclasses import dataclass, field
 from .config import PolicySettings
 from .models import Invoice, ValidationReport
 
-# Warnings that always need a human, regardless of amount.
-ESCALATE_CODES = {
-    "FOREIGN_CURRENCY": "foreign-currency invoices need treasury to confirm the FX rate",
-    "REVISED_INVOICE": "a revision of an invoice we already acted on needs AP to reconcile against the PO",
-    "INVOICE_NUMBER_COLLISION": "an invoice number reused by a different vendor needs investigation",
-    "VENDOR_ADDRESS_MISMATCH": "a changed remit address is a classic payment-redirection fraud pattern",
-    "VENDOR_NAME_VARIANT": "a look-alike vendor name must be confirmed as the same legal entity",
-    "UNKNOWN_VENDOR": "first payment to a vendor not in the vendor master needs onboarding/KYC",
-    "BANK_DETAILS_CHANGED": "a request to pay new bank details must be verified out-of-band before any payment",
-    "THRESHOLD_SPLITTING": "several sub-threshold invoices from one vendor in a week may be split to dodge VP review",
-    "EXTRACTION_UNVERIFIED": "the extracted data could not be verified against the document - a human must check it",
-}
-
+# Warnings that always need a human come from PolicySettings.always_escalate (config/ap_policy.yaml, §6).
 
 # Blocking errors detected on the raw document text, independent of how well fields were extracted.
 DOCUMENT_LEVEL_ERRORS = {"PROMPT_INJECTION"}
@@ -58,7 +46,7 @@ def assess(inv: Invoice, report: ValidationReport, policy: PolicySettings) -> Po
         reasons.append(f"{len(report.errors)} blocking validation error(s): " + ", ".join(sorted({i.code for i in report.errors})))
         return PolicyAssessment(tier, ["reject"], "reject", reasons)
 
-    escalations = [f"{i.code}: {ESCALATE_CODES[i.code]}" for i in report.warnings if i.code in ESCALATE_CODES]
+    escalations = [f"{i.code}: {policy.always_escalate[i.code]}" for i in report.warnings if i.code in policy.always_escalate]
     if escalations:
         reasons += escalations
         return PolicyAssessment(tier, ["escalate", "reject"], "escalate", reasons)
@@ -85,13 +73,13 @@ def assess(inv: Invoice, report: ValidationReport, policy: PolicySettings) -> Po
 
 def policy_text(policy: PolicySettings) -> str:
     lines = [
-        "ACME CORP ACCOUNTS PAYABLE APPROVAL POLICY",
+        f"ACME CORP ACCOUNTS PAYABLE APPROVAL POLICY ({policy.policy_id} v{policy.version})",
         "1. Any blocking validation error (unknown item, insufficient stock, bad arithmetic, missing/invalid due date, "
         "duplicate, non-positive amount, prompt injection) => REJECT. No exceptions.",
         f"2. Invoices >= ${policy.vp_review_threshold:,.0f} get VP-level scrutiny: approve only if there are zero warnings.",
         f"3. Invoices >= ${policy.cfo_threshold:,.0f} are never auto-approved: ESCALATE to a human.",
         "4. These warnings always require a human (ESCALATE or REJECT, never APPROVE):",
-        *[f"   - {code}: {why}" for code, why in ESCALATE_CODES.items()],
+        *[f"   - {code}: {why}" for code, why in policy.always_escalate.items()],
         "   Info-level notes (e.g. PAST_DUE, SPLIT_LINES, PRICE_BELOW_CATALOG) are NOT problems and are never a reason to reject.",
         "   An invoice with no errors and no warnings below the VP threshold is approved; it may not be rejected.",
         "5. Below the VP threshold, other warnings (e.g. price above catalog) are the reviewer's judgement: approve only "

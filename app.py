@@ -68,7 +68,7 @@ with st.sidebar:
 
     st.divider()
     policy = pipeline.settings.policy
-    st.caption("APPROVAL POLICY")
+    st.caption(f"APPROVAL POLICY · {policy.policy_id} v{policy.version} (config/ap_policy.yaml)")
     st.markdown(md(f"- VP scrutiny ≥ **${policy.vp_review_threshold:,.0f}**\n- Human sign-off ≥ **${policy.cfo_threshold:,.0f}**\n"
                    f"- Price tolerance **{policy.price_variance_tolerance:.0%}** over catalog"))
     st.divider()

@@ -13,6 +13,7 @@ class LineItem(BaseModel):
     quantity: float | None = Field(default=None, description="Quantity ordered. Keep negative numbers negative. null if missing.")
     unit_price: float | None = Field(default=None, description="Price per unit as a plain number. null if missing.")
     amount: float | None = Field(default=None, description="Line total as written on the invoice. null if not shown.")
+    discount: float | None = Field(default=None, description="Discount on this line as a money amount (not a percent). null if none.")
     note: str | None = Field(default=None, description="Any note on this line, e.g. 'rush order', 'volume discount'")
     sku: str | None = Field(default=None, description="Leave null. Filled in later by catalog matching.")
 

@@ -4,6 +4,7 @@ openai==3.37.0          # OpenAI-compatible client: Ollama, xAI Grok, OpenAI
 anthropic==2.1.0        # Claude
 mcp==2.3.0              # MCP servers + client (acme-erp, acme-bank, acme-ap)
 pdfplumber==0.11.10
+pyyaml==6.0.3            # config/ap_policy.yaml
 python-dateutil==3.0.0
 python-dotenv==1.2.4
 rich==15.0.0

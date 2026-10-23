@@ -1,7 +1,9 @@
-"""Runtime configuration, loaded from environment variables (and an optional .env file).
+"""Runtime configuration.
 
-Everything that differs between environments lives here: which LLM to use, where the
-database is, and the business-policy thresholds the approval agent enforces.
+Two sources, in increasing precedence:
+  1. config/ap_policy.yaml - Acme's AP policy values (thresholds, always-escalate list, limits).
+     The human-readable policy is docs/AP_POLICY.md. Override the path with AP_POLICY_FILE.
+  2. Environment variables / .env - which LLM, where the database is, and ad-hoc policy overrides.
 """
 
 from __future__ import annotations
@@ -9,7 +11,9 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
+import yaml
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -35,14 +39,39 @@ class LLMSettings:
     fallback_to_offline: bool = True
 
 
+DEFAULT_POLICY_FILE = PROJECT_ROOT / "config" / "ap_policy.yaml"
+
+# Used only if no policy file is present.
+DEFAULT_ALWAYS_ESCALATE = {
+    "FOREIGN_CURRENCY": "foreign-currency invoices need treasury to confirm the FX rate",
+    "REVISED_INVOICE": "a revision of an invoice we already acted on needs AP to reconcile against the PO",
+    "INVOICE_NUMBER_COLLISION": "an invoice number reused by a different vendor needs investigation",
+    "VENDOR_ADDRESS_MISMATCH": "a changed remit address is a classic payment-redirection fraud pattern",
+    "VENDOR_NAME_VARIANT": "a look-alike vendor name must be confirmed as the same legal entity",
+    "UNKNOWN_VENDOR": "first payment to a vendor not in the vendor master needs onboarding/KYC",
+    "BANK_DETAILS_CHANGED": "a request to pay new bank details must be verified out-of-band before any payment",
+    "THRESHOLD_SPLITTING": "near-threshold invoices from one vendor within days may be split to dodge VP review",
+    "EXTRACTION_UNVERIFIED": "the extracted data could not be verified against the document - a human must check it",
+}
+DEFAULT_FX = {"USD": 1.0, "EUR": 1.08, "GBP": 1.27, "CAD": 0.73}
+
+
 @dataclass(frozen=True)
 class PolicySettings:
-    """Approval policy. Amounts are in USD."""
+    """Approval policy (docs/AP_POLICY.md). Amounts are in the base currency."""
 
     vp_review_threshold: float = 10_000.0  # invoices at or above this get VP-level scrutiny
     cfo_threshold: float = 50_000.0  # at or above this, never auto-approve; human sign-off
     price_variance_tolerance: float = 0.10  # unit price more than 10% above catalog is flagged
     base_currency: str = "USD"
+    fx_rates: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_FX))
+    terms_tolerance_days: int = 3
+    split_window_days: int = 3
+    split_min_share: float = 0.5
+    always_escalate: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_ALWAYS_ESCALATE))
+    precedent_min_approvals: int = 2
+    policy_id: str = "FIN-AP-001"
+    version: str = "builtin"
 
 
 @dataclass(frozen=True)
@@ -62,8 +91,34 @@ class Settings:
     bank_single_payment_limit: float = 50_000.0  # enforced by the bank (MCP server), not by the agents
 
 
+def load_policy_file(path: Path | None = None) -> dict[str, Any]:
+    """Read the YAML policy. Missing file -> {} (built-in defaults apply)."""
+    path = Path(path or _env("AP_POLICY_FILE") or DEFAULT_POLICY_FILE)
+    if not path.exists():
+        return {}
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: policy file must be a mapping")
+    return data
+
+
+def _get(data: dict, dotted: str, default: Any) -> Any:
+    node: Any = data
+    for key in dotted.split("."):
+        if not isinstance(node, dict) or key not in node or node[key] is None:
+            return default
+        node = node[key]
+    return node
+
+
+def _num(env_name: str, data: dict, dotted: str, default: float) -> float:
+    """Environment wins (for experiments), then the policy file, then the built-in default."""
+    return float(_env(env_name) or _get(data, dotted, default))
+
+
 def load_settings(**overrides) -> Settings:
-    """Build settings from the environment. Keyword overrides (e.g. provider="offline") win."""
+    """Build settings from the policy file and environment. Keyword overrides (e.g. provider="offline") win."""
+    pf = load_policy_file(overrides.pop("policy_file", None))
     llm = LLMSettings(
         provider=(overrides.pop("provider", None) or _env("LLM_PROVIDER", "ollama")).lower(),
         model=overrides.pop("model", None) or _env("LLM_MODEL"),
@@ -76,9 +131,18 @@ def load_settings(**overrides) -> Settings:
         fallback_to_offline=_env("LLM_FALLBACK_TO_OFFLINE", "true").lower() == "true",
     )
     policy = PolicySettings(
-        vp_review_threshold=float(_env("VP_REVIEW_THRESHOLD", "10000")),
-        cfo_threshold=float(_env("CFO_THRESHOLD", "50000")),
-        price_variance_tolerance=float(_env("PRICE_VARIANCE_TOLERANCE", "0.10")),
+        vp_review_threshold=_num("VP_REVIEW_THRESHOLD", pf, "approval.vp_review_threshold", 10_000),
+        cfo_threshold=_num("CFO_THRESHOLD", pf, "approval.cfo_threshold", 50_000),
+        price_variance_tolerance=_num("PRICE_VARIANCE_TOLERANCE", pf, "matching.price_variance_tolerance", 0.10),
+        base_currency=str(_get(pf, "currency.base", "USD")).upper(),
+        fx_rates={k.upper(): float(v) for k, v in _get(pf, "currency.reference_rates_to_usd", DEFAULT_FX).items()},
+        terms_tolerance_days=int(_get(pf, "terms.due_date_tolerance_days", 3)),
+        split_window_days=int(_get(pf, "anti_splitting.window_days", 3)),
+        split_min_share=float(_get(pf, "anti_splitting.min_share_of_vp_threshold", 0.5)),
+        always_escalate=dict(_get(pf, "always_escalate", DEFAULT_ALWAYS_ESCALATE)),
+        precedent_min_approvals=int(_get(pf, "automation.precedent_min_approvals", 2)),
+        policy_id=str(_get(pf, "policy.id", "FIN-AP-001")),
+        version=str(_get(pf, "policy.version", "builtin")),
     )
     secondary = None
     if _env("LLM_SECONDARY_PROVIDER"):
@@ -88,12 +152,15 @@ def load_settings(**overrides) -> Settings:
             anthropic_api_key=llm.anthropic_api_key, timeout_s=llm.timeout_s, fallback_to_offline=False,
         )
     db_path = overrides.pop("db_path", None) or Path(_env("INVENTORY_DB", str(PROJECT_ROOT / "inventory.db")))
+    fast_path_default = "true" if _get(pf, "automation.fast_path", True) else "false"
     defaults = {
-        "fast_path": _env("FAST_PATH", "true").lower() == "true",
+        "fast_path": _env("FAST_PATH", fast_path_default).lower() == "true",
         "workers": int(_env("WORKERS", "4")),
         "tools_backend": _env("TOOLS_BACKEND", "local").lower(),
         "secondary_llm": secondary,
-        "bank_single_payment_limit": float(_env("BANK_SINGLE_PAYMENT_LIMIT", "50000")),
+        "bank_single_payment_limit": _num("BANK_SINGLE_PAYMENT_LIMIT", pf, "payments.single_payment_limit", 50_000),
+        "max_extraction_attempts": int(_get(pf, "automation.max_extraction_attempts", 3)),
+        "max_review_rounds": int(_get(pf, "automation.max_review_rounds", 3)),
     }
     defaults.update({k: v for k, v in overrides.items() if v is not None})
     return Settings(llm=llm, policy=policy, db_path=Path(db_path), **defaults)

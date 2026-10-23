@@ -22,7 +22,7 @@ E, W, I = Severity.ERROR, Severity.WARNING, Severity.INFO
 MONEY_TOLERANCE = 0.01
 TERMS_TOLERANCE_DAYS = 3
 
-# Mock reference FX rates (no internet at runtime). A real deployment would pull treasury rates.
+# Fallback FX rates; the policy file's currency.reference_rates_to_usd is what the checks use.
 FX_TO_USD = {"USD": 1.0, "EUR": 1.08, "GBP": 1.27, "CAD": 0.73}
 
 FRAUD_PATTERNS = {
@@ -46,8 +46,8 @@ def fingerprint(inv: Invoice) -> str:
     return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
-def to_usd(amount: float | None, currency: str) -> float | None:
-    rate = FX_TO_USD.get((currency or "USD").upper())
+def to_usd(amount: float | None, currency: str, rates: dict[str, float] | None = None) -> float | None:
+    rate = (rates or FX_TO_USD).get((currency or "USD").upper())
     return None if amount is None or rate is None else round(amount * rate, 2)
 
 
@@ -136,10 +136,15 @@ def check_arithmetic(inv: Invoice) -> list[Issue]:
         if li.quantity is None or li.unit_price is None:
             computable = False
             continue
-        expected = round(li.quantity * li.unit_price, 2)
+        discount = li.discount or 0.0
+        expected = round(li.quantity * li.unit_price - discount, 2)
+        if discount < 0 or (discount and discount > li.quantity * li.unit_price):
+            issues.append(Issue(code="INVALID_DISCOUNT", severity=E, field=f"line_items[{n}]",
+                                message=f"line {n} ({li.item}): discount ${discount:,.2f} is negative or exceeds the line value."))
         if li.amount is not None and not _close(li.amount, expected):
+            less = f" - ${discount:,.2f} discount" if discount else ""
             issues.append(Issue(code="LINE_TOTAL_MISMATCH", severity=E, field=f"line_items[{n}]",
-                                message=f"line {n} ({li.item}): {li.quantity:g} x ${li.unit_price:,.2f} = ${expected:,.2f}, invoice says ${li.amount:,.2f}."))
+                                message=f"line {n} ({li.item}): {li.quantity:g} x ${li.unit_price:,.2f}{less} = ${expected:,.2f}, invoice says ${li.amount:,.2f}."))
         line_sum += li.amount if li.amount is not None else expected
 
     if computable and inv.subtotal is not None and not _close(line_sum, inv.subtotal):
@@ -161,7 +166,7 @@ def check_arithmetic(inv: Invoice) -> list[Issue]:
     return issues
 
 
-def check_dates(inv: Invoice, today: date | None = None) -> list[Issue]:
+def check_dates(inv: Invoice, today: date | None = None, terms_tolerance_days: int = TERMS_TOLERANCE_DAYS) -> list[Issue]:
     issues: list[Issue] = []
     today = today or date.today()
     if not inv.invoice_date:
@@ -176,7 +181,7 @@ def check_dates(inv: Invoice, today: date | None = None) -> list[Issue]:
             issues.append(Issue(code="DUE_BEFORE_INVOICE", severity=E, field="due_date",
                                 message=f"Due date {inv.due_date} is before invoice date {inv.invoice_date}."))
         terms_days = parse_terms_days(inv.payment_terms)
-        if terms_days is not None and days >= 0 and abs(days - terms_days) > TERMS_TOLERANCE_DAYS:
+        if terms_days is not None and days >= 0 and abs(days - terms_days) > terms_tolerance_days:
             issues.append(Issue(code="TERMS_MISMATCH", severity=W, field="due_date",
                                 message=f"Terms say '{inv.payment_terms}' but due date is {days} days after the invoice date."))
     if due < today:
@@ -207,11 +212,11 @@ def check_currency(inv: Invoice, policy: PolicySettings) -> list[Issue]:
     currency = (inv.currency or "USD").upper()
     if currency == policy.base_currency:
         return []
-    if currency not in FX_TO_USD:
+    if currency not in policy.fx_rates:
         return [Issue(code="UNSUPPORTED_CURRENCY", severity=E, field="currency", message=f"Currency {currency} is not supported.")]
-    usd = to_usd(inv.total, currency)
+    usd = to_usd(inv.total, currency, policy.fx_rates)
     return [Issue(code="FOREIGN_CURRENCY", severity=W, field="currency",
-                  message=f"Invoice is in {currency} (~${usd:,.2f} USD at reference rate {FX_TO_USD[currency]}); "
+                  message=f"Invoice is in {currency} (~${usd:,.2f} USD at reference rate {policy.fx_rates[currency]}); "
                           "catalog prices can't be compared and treasury must confirm the FX rate.")]
 
 
@@ -274,24 +279,22 @@ def check_prompt_injection(raw_text: str) -> list[Issue]:
                   message=f"Document contains instructions aimed at the AP system (e.g. '{hits[0][:80]}') - treated as an attack.")]
 
 
-SPLIT_WINDOW_DAYS = 3
-SPLIT_MIN_SHARE = 0.5  # only near-threshold invoices count: vendors legitimately send many small ones
 
 
 def check_threshold_splitting(inv: Invoice, store: Store, policy: PolicySettings) -> list[Issue]:
     """Same vendor billing several sub-threshold invoices in one week that together cross the VP threshold."""
-    usd = to_usd(inv.total, inv.currency)
-    floor = SPLIT_MIN_SHARE * policy.vp_review_threshold
+    usd = to_usd(inv.total, inv.currency, policy.fx_rates)
+    floor = policy.split_min_share * policy.vp_review_threshold
     if not usd or not floor <= usd < policy.vp_review_threshold or not inv.invoice_date:
         return []
-    recent = [r for r in store.recent_vendor_invoices(inv.vendor, inv.invoice_date, SPLIT_WINDOW_DAYS)
+    recent = [r for r in store.recent_vendor_invoices(inv.vendor, inv.invoice_date, policy.split_window_days)
               if r["invoice_number"] != inv.invoice_number and floor <= (r["total"] or 0) < policy.vp_review_threshold]
     combined = usd + sum(r["total"] or 0 for r in recent)
     if not recent or combined < policy.vp_review_threshold:
         return []
     others = ", ".join(f"{r['invoice_number']} (${r['total']:,.2f})" for r in recent[:4])
     return [Issue(code="THRESHOLD_SPLITTING", severity=W, field="total",
-                  message=f"{inv.vendor} billed {len(recent) + 1} invoices within {SPLIT_WINDOW_DAYS} days totalling ${combined:,.2f}, "
+                  message=f"{inv.vendor} billed {len(recent) + 1} invoices within {policy.split_window_days} days totalling ${combined:,.2f}, "
                           f"each under the ${policy.vp_review_threshold:,.0f} VP threshold ({others}) - possible split to avoid review.")]
 
 
@@ -306,7 +309,7 @@ def run_all_checks(inv: Invoice, raw_text: str, store: Store, policy: PolicySett
         *check_required_fields(inv),
         *check_line_items(inv, store, policy),
         *check_arithmetic(inv),
-        *check_dates(inv, today),
+        *check_dates(inv, today, policy.terms_tolerance_days),
         *check_vendor(inv, store),
         *check_currency(inv, policy),
         *check_duplicates(inv, store),
@@ -316,6 +319,6 @@ def run_all_checks(inv: Invoice, raw_text: str, store: Store, policy: PolicySett
     ]
     rank = {E: 0, W: 1, I: 2}
     issues.sort(key=lambda i: rank[i.severity])  # stable: keeps check order within a severity
-    report = ValidationReport(issues=issues, checks_run=list(CHECKS), total_usd=to_usd(inv.total, inv.currency))
+    report = ValidationReport(issues=issues, checks_run=list(CHECKS), total_usd=to_usd(inv.total, inv.currency, policy.fx_rates))
     report.risk_score = min(100, 35 * len(report.errors) + 12 * len(report.warnings))
     return report

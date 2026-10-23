@@ -43,7 +43,7 @@ pip install -r requirements.txt
 python main.py --all                 # process every sample, print a summary
 streamlit run app.py                 # dashboard: live agent steps, review queue, operations, ledger
 python -m invoice_agents.loadtest    # 1,000 synthetic invoices, scored against ground truth
-pytest                               # 129 tests
+pytest                               # 146 tests
 ```
 
 No model or API key is needed to try it. If the configured LLM isn't reachable, the agents fall back to deterministic rules and say so. The database (`inventory.db`) is created and seeded automatically on first run. Run `python -m invoice_agents.db --reset` to recreate it.
@@ -182,7 +182,20 @@ Built with **LangGraph**. Each box is a node, and the two loops are conditional 
 | < $10,000 with warnings | reviewer's judgement (approve only if the invoice documents the reason, or humans set a precedent) |
 | < $10,000, clean | approve (fast path) |
 
-Thresholds are configurable in `.env`.
+The full policy is **[docs/AP_POLICY.md](docs/AP_POLICY.md)** (FIN-AP-001). It covers:
+
+- roles and segregation of duties
+- the approval matrix
+- purchase orders and matching
+- vendor onboarding and bank-change verification
+- duplicates and special invoice types (credit notes, pro-formas, deposits…)
+- tax, FX and payments
+- fraud
+- AI-agent governance
+- service levels and audit
+- a playbook of 25 situations
+
+The values the agents enforce live in **[config/ap_policy.yaml](config/ap_policy.yaml)**: thresholds, the always-escalate list, accepted currencies, the bank limit, and the anti-splitting window. Change the policy by editing that file, with no code change. Tests prove each edit changes outcomes, and catch typos in rule codes.
 
 ## Using it
 
@@ -231,9 +244,13 @@ invoice_agents/
   llm/                      provider-agnostic client: base, OpenAI-compatible (Ollama/xAI/OpenAI), Anthropic
   db.py                     SQLite (WAL): inventory, vendors, invoices, payments, jobs, human decisions, audit log
   models.py · prompts.py · config.py · normalize.py · state.py
-tests/                      129 tests, incl. scripted-LLM tests of every agentic loop
+tests/                      146 tests, incl. scripted-LLM tests of every agentic loop
 data/invoices/              the provided samples
 data/adversarial/           prompt injection, bank change, remit change, split invoices, scanned PDF
+data/templates/             invoice_template.json: every field a complete invoice can carry
+docs/INVOICE_FIELDS.md      what each field is for and which validation it enables (today vs. next)
+docs/AP_POLICY.md           the written AP policy (FIN-AP-001)
+config/ap_policy.yaml       the policy values the agents enforce
 ```
 
 ## Testing
